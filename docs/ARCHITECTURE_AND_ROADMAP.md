@@ -205,6 +205,8 @@ When extending this codebase, keep these exact Mojo 1.2 behaviors in mind (also 
 ## 7. Strategic Opportunities (I/O, Duck Arrays, GPU)
 
 ### 7.1 Plugging In Your Existing Zero-Copy Mojo Binary File Decoders
+> **See also:** [`docs/boreal/`](boreal/README.md) — how boreal-io / aether / postproc / stat use xarray, dask, and FST decode today (contracts for `RecordCatalog`, masks, and peel→kernel→rewrap).
+
 Your existing Mojo decoders already unpack compressed binary records in place. Connecting them directly to `vm.mojo` removes Python from the I/O loop completely:
 1. Build a lightweight **Binary Record Index (`RecordCatalog`)** mapping `(var_id, time_idx, level_idx) -> (file_idx, byte_offset, byte_len, encoding_tag)` (stored as a flat `mmap`-able struct array—even $50\text{ million}$ records is only $1.2\text{ GB}$ on disk / demand-paged in RAM!).
 2. Partition work by `(file_idx, record_idx)` across Mojo worker threads so each thread issues `pread` into a reusable compressed buffer, runs your Mojo decoder into a thread-local `SlabCache`, and streams `2,048`-element morsels through `eval_morsel_bytecode`.
@@ -222,6 +224,8 @@ For compute-dense diagnostics (3D moist thermodynamics, iterative wet-bulb/equiv
 ---
 
 ## 8. Roadmap to a Full Production Xarray + Dask Replacement
+
+Boreal-facing milestone checklist and phased UX (duck array → pure Mojo Dataset): [`docs/boreal/10-mojo-replacement-checklist.md`](boreal/10-mojo-replacement-checklist.md).
 
 ### Milestone M1 — Pluggable Out-of-Core Binary File Catalog & Decoder Trait
 * **Deliverables:**
