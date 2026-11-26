@@ -128,16 +128,18 @@ pixi run bench-fst-real -- --smoke
 
 ## 9. P0 Implementation Status (Ready for Work-Machine Real-FST Smoke)
 
-All 5 P0 items + Wishlist #28 KPI are now wired and verified locally (`pixi run test` + `pixi run test-p0`):
+Wired and verified for **CF assembly + thin peel + R-P0 KPI** (`pixi run test` + `pixi run test-p0` + `bench-fst-real`). **Live ops FST cold open is still slower than boreal** — see [`docs/boreal/13-cold-open-work-machine.md`](docs/boreal/13-cold-open-work-machine.md).
 
 1. **Multi-file OS I/O pool (`src/marray/catalog.mojo`, `python/marray_xr/catalog.py`):**
    - `CatalogFilePool` (`marray_file_pool_create` / `marray_file_pool_destroy`) manages read-only POSIX file descriptors across multi-lead files using thread-safe `pread` (`_pread_exact`), keeping Python `np.memmap` LRU off the hot path.
    - `REC_META_STRIDE = 10` (`[file_id, d_off, d_len, datyp, nbits, bmap_file_id, bm_off, bm_len, b_dt, b_nb]`) supports multi-file records, `@@` companion bitmaps, ragged `pad` missing slots (`d_len <= 0`), and RPN alt-masks (`64 <= datyp < 128`, max-value marks missing).
    - Shared single-plane pre-decode (`load_morsel_from_predecoded_catalog` in `catalog.mojo` / `vm.mojo`) ensures thin 2D peels (`n_cats * n_zt <= 48`) decode each touched `(var, rec_idx)` plane **once** across all 16 worker threads (`mxr.get_last_decoded_planes() == 2` on `hypot(u2d, v2d)`).
-2. **Live `open_fst_xarray(paths)` (`python/marray_xr/fst_open.py`):**
+   - Pool is used for `.mfst` and Tier A; **Tier B (current ops default) skips the pool** (`CAT_FLAG_ADDR_MODE | CAT_FLAG_FORCE_SERIAL`).
+2. **Live `open_fst_xarray(paths)` (`python/marray_xr/fst_open.py`) — hybrid:**
    - Accepts operational `.std` / `.fst` lead paths (via `MARRAY_CMC_IO` / `cmc_root`) or standalone `.mfst` multi-lead files.
-   - Extracts per-record header metadata (`path, addr, lng, datyp, nbits, mask_addr, mask_lng`) without computing any Dask graph or re-packing payloads, splits compatible groups (`vctype`), preserves CF spatial dims (`rlat`/`rlon`, `lat`/`lon`, or `y`/`x`), 2D geographic `lat`/`lon`, `areacell`, `datetime64[ns]` `time`, OpenData names, and `fst_*` attrs.
-   - **Decoder resolution:** Uses **Tier A** (`MARRAY_CMC_CABI_SO` built from [`bridges/cmc_io_cabi_shim.mojo`](bridges/cmc_io_cabi_shim.mojo) against `$MARRAY_CMC_IO` for 16-thread zero-GIL POSIX `pread` + `cmc_io_fst.unpack_batch`) when present, and automatically falls back out-of-the-box to **Tier B** (`ctypes` `CFUNCTYPE` bridge calling `boreal.io.xarray.decode` single-record unpackers on demand into `PlaneSlotCache`, followed by 16-thread SIMD morsel compute).
+   - **`.mfst`:** true O(headers) catalog + `FilePool` (what `test-p0` measures).
+   - **Ops `.std`:** still calls `boreal.io.open_fst(..., chunks="record")`, scrapes the Dask HLG for `(addr,lng,datyp,…)`, then rebuilds `CatalogVarSpec` + `xr.Dataset` — CF/attrs parity yes; open wall **slower** than boreal alone. Direct `cmc_io_fst_hdr` → catalog (wishlist #16) is **not** done.
+   - **Decoder resolution:** **Tier A blocked** — [`bridges/cmc_io_cabi_shim.mojo`](bridges/cmc_io_cabi_shim.mojo) does not compile against current `cmc_io_fst.xdf.unpack_batch` / `unpack_one_f32`. Discovery uses **`MARRAY_CMC_DECODER_SO`** (also accept aliasing `MARRAY_CMC_CABI_SO` when implemented) + `build/libcmc_marray_bridge.so`. Falls back to **Tier B** (`ctypes` trampoline → keyword-only `unpack_record_from_path` into `PlaneSlotCache`, then 16-thread SIMD morsel compute).
 3. **Xarray `BackendEntrypoint` & `ChunkManagerEntrypoint` (`python/marray_xr/xarray_backend.py`, `pyproject.toml`):**
    - Registers `engine="marray_fst"` (`MarrayFstBackendEntrypoint`) and `chunked_array_type="marray"` (`MarrayChunkManager`) both in `pyproject.toml` and dynamically on `import marray_xr` (works under `PYTHONPATH` on PBS nodes without `pip install`).
    - Hooks `da.compute()`, `ds.compute()` (single-pass multi-sink `compute_many`!), and zero-decode `repr(ds)` with **zero Dask dependency**.
@@ -149,3 +151,4 @@ All 5 P0 items + Wishlist #28 KPI are now wired and verified locally (`pixi run 
    pixi run bench-fst-real -- --smoke --mode lazy-open
    pixi run bench-fst-real -- --leads 4 --mode both
    ```
+   Handoff / backlog: [`docs/boreal/13-cold-open-work-machine.md`](docs/boreal/13-cold-open-work-machine.md).

@@ -355,15 +355,17 @@ def _make_boreal_addr_trampoline(file_paths: list[str]) -> tuple[int, Any]:
             rpn_addr = int(ctx_and_addr)
             out_view = np.ctypeslib.as_array(dst_f32, shape=(int(nj), int(ni)))
             if unpack_single is not None:
+                # boreal API: keyword-only after path; layout="C" → (nj, ni)
                 plane = unpack_single(
                     path,
-                    rpn_addr,
-                    int(rpn_lng),
-                    int(ni),
-                    int(nj),
-                    max(1, nk),
-                    int(datyp),
-                    int(nbits),
+                    addr=rpn_addr,
+                    lng=int(rpn_lng),
+                    ni=int(ni),
+                    nj=int(nj),
+                    nk=max(1, nk),
+                    datyp=int(datyp),
+                    nbits=int(nbits),
+                    layout="C",
                 )
                 arr = np.asarray(plane, dtype=np.float32)
                 if arr.shape == (int(ni), int(nj)):
@@ -371,10 +373,12 @@ def _make_boreal_addr_trampoline(file_paths: list[str]) -> tuple[int, Any]:
                 out_view[:] = arr.reshape(int(nj), int(ni))
                 return 0
             if unpack_many is not None:
+                # specs=(addr,lng,ni,nj,nk,datyp,nbits); starts=flat element offsets
                 unpack_many(
                     path,
                     [(rpn_addr, int(rpn_lng), int(ni), int(nj), max(1, nk), int(datyp), int(nbits))],
-                    out_view[np.newaxis, :, :],
+                    out_view.reshape(-1),
+                    [0],
                 )
                 return 0
             return -1

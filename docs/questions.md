@@ -116,11 +116,13 @@ Compute / M4 duck path ([`open_fst_xarray`](../python/marray_xr/duck.py)) is dir
 
 ### P0 — Make `open_fst` → xarray the fast path (“at least load”)
 
-16. **Live header → catalog:** Wire `cmc_io_fst_hdr` rows (`path`, `addr`, `lng`, `datyp`, `nbits`, `ni`/`nj`, mask offsets) into `CatalogVarSpec` / `PackedFSTArchive`-shaped meta **without re-encoding** payloads.
-17. **Real `ChunkDecoder`:** Export / adapt a `ChunkDecoderCABI`-compatible symbol from `cmc_io_fst` (`unpack_*_from_raw`) so `decoder_fn_addr` is the **production** codec—not `marray_builtin_fst_chunk_decoder` on re-packed bytes.
-18. **I/O pool:** OS `mmap`/`pread` + per-worker fd pool for multi-file leads (remove Python memmap LRU from the hot path).
-19. **Ops `open_fst_xarray(paths)`:** Return `list[xr.Dataset]` with CF dims (`time`, `vertical`, `rlat`/`rlon`), `fst_*` attrs, `areacell`, `vctype` split — parity with boreal `open_fst` assembly, **zero Dask HLG**.
-20. **BackendEntrypoint:** Register `xr.open_dataset(..., engine="marray_fst")` (ARCHITECTURE M4 next step).
+Status vs work-machine smoke ([`boreal/13-cold-open-work-machine.md`](boreal/13-cold-open-work-machine.md)): **16 / 17 / 19 partial**; **18** done for `.mfst` / Tier A only (Tier B skips pool); **20** done; **28** done (KPI exposes open regression). Live ops cold open is still **slower** than boreal `chunks='record'`.
+
+16. **Live header → catalog:** Wire `cmc_io_fst_hdr` rows (`path`, `addr`, `lng`, `datyp`, `nbits`, `ni`/`nj`, mask offsets) into `CatalogVarSpec` / `PackedFSTArchive`-shaped meta **without re-encoding** payloads. *(Partial: ops path scrapes boreal record HLG instead of a direct header table.)*
+17. **Real `ChunkDecoder`:** Export / adapt a `ChunkDecoderCABI`-compatible symbol from `cmc_io_fst` (`unpack_*_from_raw` / `unpack_one_f32`) so `decoder_fn_addr` is the **production** codec—not `marray_builtin_fst_chunk_decoder` on re-packed bytes. *(Blocked: shim stale vs `cmc_io_fst.xdf.unpack_batch`; Tier B ctypes trampoline only.)*
+18. **I/O pool:** OS `mmap`/`pread` + per-worker fd pool for multi-file leads (remove Python memmap LRU from the hot path). *(Done for `.mfst` + Tier A; Tier B addr-mode does not use the pool.)*
+19. **Ops `open_fst_xarray(paths)`:** Return `list[xr.Dataset]` with CF dims (`time`, `vertical`, `rlat`/`rlon`), `fst_*` attrs, `areacell`, `vctype` split — parity with boreal `open_fst` assembly, **zero Dask HLG**. *(CF/attrs parity yes; HLG still built then discarded — open slower than boreal.)*
+20. **BackendEntrypoint:** Register `xr.open_dataset(..., engine="marray_fst")` (ARCHITECTURE M4 next step). *(Done.)*
 
 ### P1 — Kill peel / rewrap in consumers
 
