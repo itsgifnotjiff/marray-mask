@@ -1,0 +1,125 @@
+# Context: Accelerate FST → xarray Dataset Load
+
+Working brief for the next engineering goal: make **decoded, uncompressed FST fields** available as genuine `xarray.Dataset` objects through `marray-mask`, without Dask HighLevelGraph construction or eager full-cube peels.
+
+Do not embed absolute suite or checkout paths in code or docs. Use `MARRAY_CMC_IO` and `MARRAY_FST_PRES_ROOT` (or CLI `--root`) on the work machine.
+
+---
+
+## 1. Goal
+
+Replace boreal-io’s `open_fst` path (Dask HLG for `chunks="record"|"column"`, or eager NumPy for `chunks=False`) with marray-mask’s **`RecordCatalog` + `MarrayDuckArray`** so callers receive:
+
+```text
+list[xr.Dataset]   # one Dataset per compatible group (vctype / grid / ragged rules)
+```
+
+Each data variable is backed by a duck array that **lazily whole-plane-decodes** FST records (`datyp=134`, bitmaps, …) only when `.isel` / `.sel` / `.compute` / ufuncs demand it. CF coords, OpenData names, and `fst_*` attrs must stay compatible with polaris, mogc-api, boreal-postproc, and boreal-stat.
+
+**Success looks like:** `dss = open_fst_xarray(paths)` (or `xr.open_dataset(..., engine="marray_fst")`) returns usable Datasets in ≪1 s for multi-lead catalogs, with RAM dominated by headers + working planes—not a full unpacked cube or a giant HLG.
+
+---
+
+## 2. Why it matters
+
+FST **unpack codecs are already Mojo** inside boreal-io (`cmc_io_fst_data`). The remaining tax on the boreal stack is:
+
+- Python Dataset assembly and **dask HighLevelGraph** construction inside `open_fst`
+- **Peel → contiguous buffer → rewrap** around every consumer kernel
+
+See [`docs/boreal/README.md`](docs/boreal/README.md). Serving apps (mogc GetMap) often spend **~0.3–1 s on cold `open_fst`** before cache (Q12 in [`docs/questions.md`](docs/questions.md)).
+
+Post-decode **compute** is already strong: real GDPS `pres` smoke (`bench_fst_real`) showed ~**55×** thin 2D peel and ~**19×** KE / weighted reductions vs column-HLG / eager xarray on the same arenas ([`docs/questions.md`](docs/questions.md) §5). The stack-level win for “load into xarray” is finishing the **open/decode wiring**, not reinventing the morsel VM.
+
+---
+
+## 3. Current vs target
+
+```mermaid
+flowchart LR
+  today[Today] --> borealOpen[boreal_open_fst]
+  borealOpen --> hlgOrEager[HLG_or_eager_numpy]
+  target[Target] --> hdr[cmc_io_fst_hdr]
+  hdr --> catalog[CatalogVarSpec]
+  catalog --> decoder[ChunkDecoderCABI_cmc_io]
+  decoder --> duck[open_fst_xarray]
+  duck --> xrDs[list_xr_Dataset]
+```
+
+| | Today (smoke / hybrid) | Target (P0) |
+|--|------------------------|-------------|
+| Open | `boreal.io.open_fst(..., chunks=False)` eager unpack | Header scan only → `CatalogVarSpec` |
+| Decode | Real `cmc_io` in Phase 0; M1 R-B6 **re-packs** with **builtin** reference codec | Live `ChunkDecoderCABI` → `cmc_io_fst` `unpack_*_from_raw` |
+| xarray | NumPy after eager open, or duck over re-packed archive | `MarrayDuckArray` over ops mmap / `pread` |
+| Graph | Dask HLG when using boreal lazy chunks | **No Dask** for compute |
+
+---
+
+## 4. What already exists
+
+| Piece | Location | Notes |
+|-------|----------|--------|
+| M1 catalog engine | [`src/marray/catalog.mojo`](src/marray/catalog.mojo), [`python/marray_xr/catalog.py`](python/marray_xr/catalog.py) | `ChunkDecoderCABI`, `PlaneSlotCache`, `open_fst_catalog`, builtin `datyp=134` / `@@` reference codecs |
+| M4 Phase A duck | [`python/marray_xr/duck.py`](python/marray_xr/duck.py) | `MarrayDuckArray`, `open_fst_xarray(archive)` — **archive is `PackedFSTArchive` today, not ops paths** |
+| CF / open contract | [`docs/boreal/03-open-fst-and-cf-assembly.md`](docs/boreal/03-open-fst-and-cf-assembly.md), [`06-cf-attrs-and-consumer-contract.md`](docs/boreal/06-cf-attrs-and-consumer-contract.md) | `list[Dataset]`, `vctype` split, `fst_nomvar`, `areacell`, `rlat`/`rlon` |
+| Real-FST bench | [`benchmarks/bench_fst_real.py`](benchmarks/bench_fst_real.py), [`benchmarks/fst_real_load.py`](benchmarks/fst_real_load.py) | Env-gated; decode vs compute phases |
+| Design answers + wishlist | [`docs/questions.md`](docs/questions.md) | Q1–Q15 answered; **§5 P0 items 16–20** are this goal |
+| Roadmap | [`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md) §8 M1/M4 “next steps” | Wire `cmc_io` + BackendEntrypoint |
+| Checklist | [`docs/boreal/10-mojo-replacement-checklist.md`](docs/boreal/10-mojo-replacement-checklist.md) | Acceptance sketches for open / W1 / postproc |
+
+**ABI contract (Q1):** production = separate `.so` files. marray calls a thin C-ABI function pointer into boreal’s unpacker; do not import `cmc_io_fst_data` from inside the morsel VM.
+
+**Decode contract (Q4):** `datyp=134` is **whole-record**; regional slices decode the full `(ni,nj)` plane once (`PlaneSlotCache`), then copy the window.
+
+---
+
+## 5. Gap — do this next (P0)
+
+1. **Live headers → catalog** — Map `cmc_io_fst_hdr` rows (`path`, `addr`/`lng`, `datyp`, `nbits`, `ni`/`nj`/`nk`, companion mask offsets) into `CatalogVarSpec` / archive meta **without re-encoding** payloads.
+2. **Real ChunkDecoder** — Export or adapt a `ChunkDecoderCABI`-compatible symbol from `cmc_io_fst` (`unpack_*_from_raw`) so `decoder_fn_addr` is production codecs, not `marray_builtin_fst_chunk_decoder` on re-packed bytes.
+3. **I/O pool** — OS `mmap` / `pread` + per-worker fd cache for multi-file leads (keep Python memmap LRU off the hot path).
+4. **`open_fst_xarray(paths)`** — CF parity with boreal assembly: dims (`time`, `vertical`, `rlat`/`rlon` or `y`/`x`), `fst_*` attrs, `areacell`, `vctype` / grid split → `list[xr.Dataset]`, zero Dask HLG.
+5. **BackendEntrypoint** — `xr.open_dataset(..., engine="marray_fst")` (ARCHITECTURE M4 next step).
+
+P1+ (postproc drop-in, M3 `where`, aether handoff, streaming write, packed `@@`) is listed in [`docs/questions.md`](docs/questions.md) §5 but is **out of scope** until the load path works.
+
+---
+
+## 6. Acceptance (load path)
+
+- Multi-lead GDPS-style archive: **catalog open is O(headers)** and uses ≪ RAM of a record-chunk Dask HLG.
+- First thin `.isel(time=…)` + nearest `vertical` materializes **only needed planes** (plus bitmap if present).
+- Returned objects are real `xr.Dataset`s (coords, attrs, OpenData names) usable by unmodified xarray consumers; **no Dask import required for compute**.
+- Parity: bit-close to boreal `open_fst(..., chunks=False)` on sampled peels (tolerate `datyp=134` quantization).
+- KPI: extend `bench_fst_real` to report **lazy open + first `.isel` compute** vs boreal `chunks="column"|"record"|False` on the same leads (wishlist item 28).
+
+---
+
+## 7. How to work / verify
+
+```bash
+export MARRAY_CMC_IO=...          # boreal-io / cmc-io checkout (cmc_io_fst_*.so)
+export MARRAY_FST_PRES_ROOT=...   # GDPS-style prog/pres directory of leads
+pixi install
+pixi run build-ext
+pixi run bench-fst-real -- --smoke
+# fuller / PBS: see scripts/pbs/bench_fst_real.sh (requires the same env vars)
+```
+
+**Read next (in order):**
+
+1. [`docs/questions.md`](docs/questions.md) §5 P0 (items 16–20)
+2. [`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md) §8 M1 & M4 next steps
+3. [`docs/boreal/03-open-fst-and-cf-assembly.md`](docs/boreal/03-open-fst-and-cf-assembly.md)
+4. [`docs/boreal/02-fst-decode-pipeline.md`](docs/boreal/02-fst-decode-pipeline.md)
+5. [`docs/boreal/10-mojo-replacement-checklist.md`](docs/boreal/10-mojo-replacement-checklist.md)
+6. Code: `catalog.mojo` / `catalog.py` / `duck.py` / `ChunkDecoderCABI` signature in `catalog.mojo`
+
+---
+
+## 8. Out of scope for this brief
+
+- Replacing **aether** CSR remapping inside the morsel VM
+- Full M3 (boolean `where`), M5 (stencils), M6 (multi-node / GPU)
+- Committing operational suite paths or FST binaries
+- Changing published synthetic B1–B8 numbers

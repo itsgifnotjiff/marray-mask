@@ -3,6 +3,7 @@
 A high-performance **Mojo 1.2** masked array, whole-record `ChunkDecoder` catalog, and lazy bytecode execution stack designed to replace Python's `NumPy.ma + Dask + Xarray` chunk-orchestration bottleneck on large ($10\text{ GB} \to 1\text{ PB+}$) scientific/NWP datasets across the **boreal** (`boreal-io`, `boreal-postproc`, `boreal-stat`, `polaris`, `mogc-api`) and **aether** ecosystem.
 
 📖 **Deep-Dive Documentation:**
+* **[`CONTEXT.md`](CONTEXT.md)** — Working brief: accelerate decoded FST → `xarray.Dataset` load (gap, P0, acceptance).
 * **[`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md)** — Full architectural design, C-ABI `ChunkDecoder` & M4 duck-array contracts, roofline math, B1–B8 Boreal/Aether benchmarks, Mojo 1.2 subtleties, and remaining roadmap.
 * **[`docs/boreal/`](docs/boreal/README.md)** & **[`docs/questions.md`](docs/questions.md)** — Cross-package contracts and answered engineering decisions for `boreal-io`, `boreal-postproc`, `boreal-stat`, `aether`, `polaris`, and `mogc-api`.
 
