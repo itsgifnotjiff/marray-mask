@@ -22,8 +22,15 @@ from std.os import abort
 from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.runtime import initialize_runtime, parallelism_level
-from std.sys import simd_width_of
+from std.sys import has_accelerator, simd_width_of
+from std.memory import Layout, alloc
 from max.algorithm import parallelize
+
+from marray.tensor_layout_ops import (
+    CompiledMaxSession,
+    exec_compiled_humidex_wind_cpu,
+    exec_vorticity_stencil_cpu,
+)
 
 from marray.catalog import (
     CatalogSourceDesc,
@@ -597,6 +604,277 @@ def marray_synth_boreal_cube(
 
     parallelize(fill_worker, n_workers)
     return Int32(0)
+
+
+# ===----------------------------------------------------------------------=== #
+# Additive `TensorLayout` & Compiled MAX/GPU Session Exports
+# ===----------------------------------------------------------------------=== #
+
+
+@export("marray_has_gpu_accelerator")
+def marray_has_gpu_accelerator() abi("C") -> Int32:
+    comptime if has_accelerator():
+        return Int32(1)
+    else:
+        return Int32(0)
+
+
+@export("marray_exec_vorticity_stencil_cpu")
+def marray_exec_vorticity_stencil_cpu(
+    u_ptr: ImmPointer[Float32, ImmUntrackedOrigin],
+    v_ptr: ImmPointer[Float32, ImmUntrackedOrigin],
+    bmap_ptr: ImmPointer[UInt8, ImmUntrackedOrigin],
+    n_slabs: Int32,
+    nj: Int32,
+    ni: Int32,
+    fortran_order: Int32,
+    inv_2dx: Float32,
+    inv_2dy: Float32,
+    fill_val: Float32,
+    out_ptr: MutPointer[Float32, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    exec_vorticity_stencil_cpu(
+        u_ptr,
+        v_ptr,
+        bmap_ptr,
+        Int(n_slabs),
+        Int(nj),
+        Int(ni),
+        fortran_order != 0,
+        inv_2dx,
+        inv_2dy,
+        fill_val,
+        out_ptr,
+    )
+    return Int32(0)
+
+
+@export("marray_exec_compiled_humidex_wind_cpu")
+def marray_exec_compiled_humidex_wind_cpu(
+    tt_ptr: ImmPointer[Float32, ImmUntrackedOrigin],
+    hu_ptr: ImmPointer[Float32, ImmUntrackedOrigin],
+    uu_ptr: ImmPointer[Float32, ImmUntrackedOrigin],
+    vv_ptr: ImmPointer[Float32, ImmUntrackedOrigin],
+    bmap_ptr: ImmPointer[UInt8, ImmUntrackedOrigin],
+    total_elems: Int64,
+    fill_val: Float32,
+    out_hmx: MutPointer[Float32, MutUntrackedOrigin],
+    out_uv: MutPointer[Float32, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    exec_compiled_humidex_wind_cpu(
+        tt_ptr,
+        hu_ptr,
+        uu_ptr,
+        vv_ptr,
+        bmap_ptr,
+        Int(total_elems),
+        fill_val,
+        out_hmx,
+        out_uv,
+    )
+    return Int32(0)
+
+
+@export("marray_max_session_create")
+def marray_max_session_create(
+    n_t: Int32,
+    nk: Int32,
+    nj: Int32,
+    ni: Int32,
+    n_dst: Int32,
+    nnz: Int32,
+    h_levels: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_indptr: ImmPointer[Int32, ImmUntrackedOrigin],
+    h_indices: ImmPointer[Int32, ImmUntrackedOrigin],
+    h_weights: ImmPointer[Float64, ImmUntrackedOrigin],
+) abi("C") -> Int64:
+    comptime if not has_accelerator():
+        return Int64(0)
+    else:
+        try:
+            var raw = alloc(Layout[CompiledMaxSession](count=1))
+            var ptr = raw^.unsafe_leak()
+            ptr.unsafe_write(
+                CompiledMaxSession(
+                    Int(n_t),
+                    Int(nk),
+                    Int(nj),
+                    Int(ni),
+                    Int(n_dst),
+                    Int(nnz),
+                    h_levels,
+                    h_indptr,
+                    h_indices,
+                    h_weights,
+                )
+            )
+            return Int64(Int(ptr))
+        except:
+            return Int64(0)
+
+
+@export("marray_max_session_destroy")
+def marray_max_session_destroy(handle: Int64) abi("C") -> Int32:
+    comptime if has_accelerator():
+        if handle != 0:
+            var ptr = MutPointer[CompiledMaxSession, MutUntrackedOrigin](
+                unsafe_from_address=Int(handle)
+            )
+            _ = ptr.unsafe_take_pointee()
+            ptr.unsafe_free()
+    return Int32(0)
+
+
+@export("marray_max_session_stage_cube")
+def marray_max_session_stage_cube(
+    handle: Int64,
+    h_tt: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_hu: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_uu: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_vv: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_bmap: ImmPointer[UInt8, ImmUntrackedOrigin],
+) abi("C") -> Int32:
+    comptime if not has_accelerator():
+        return Int32(-1)
+    else:
+        if handle == 0:
+            return Int32(-1)
+        try:
+            var ptr = MutPointer[CompiledMaxSession, MutUntrackedOrigin](
+                unsafe_from_address=Int(handle)
+            )
+            ptr[].stage_cube_inputs(h_tt, h_hu, h_uu, h_vv, h_bmap)
+            return Int32(0)
+        except:
+            return Int32(-2)
+
+
+@export("marray_max_session_vorticity_gpu")
+def marray_max_session_vorticity_gpu(
+    handle: Int64,
+    fortran_order: Int32,
+    inv_2dx: Float32,
+    inv_2dy: Float32,
+    fill_val: Float32,
+    copy_back: Int32,
+    h_out: MutPointer[Float32, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    comptime if not has_accelerator():
+        return Int32(-1)
+    else:
+        if handle == 0:
+            return Int32(-1)
+        try:
+            var ptr = MutPointer[CompiledMaxSession, MutUntrackedOrigin](
+                unsafe_from_address=Int(handle)
+            )
+            ptr[].exec_vorticity_gpu(
+                fortran_order != 0, inv_2dx, inv_2dy, fill_val, copy_back != 0, h_out
+            )
+            return Int32(0)
+        except:
+            return Int32(-2)
+
+
+@export("marray_max_session_humidex_wind_gpu")
+def marray_max_session_humidex_wind_gpu(
+    handle: Int64,
+    upload_inputs: Int32,
+    copy_outputs: Int32,
+    h_tt: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_hu: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_uu: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_vv: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_bmap: ImmPointer[UInt8, ImmUntrackedOrigin],
+    fill_val: Float32,
+    h_out_hmx: MutPointer[Float32, MutUntrackedOrigin],
+    h_out_uv: MutPointer[Float32, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    comptime if not has_accelerator():
+        return Int32(-1)
+    else:
+        if handle == 0:
+            return Int32(-1)
+        try:
+            var ptr = MutPointer[CompiledMaxSession, MutUntrackedOrigin](
+                unsafe_from_address=Int(handle)
+            )
+            ptr[].exec_humidex_wind_gpu(
+                upload_inputs != 0,
+                copy_outputs != 0,
+                h_tt,
+                h_hu,
+                h_uu,
+                h_vv,
+                h_bmap,
+                fill_val,
+                h_out_hmx,
+                h_out_uv,
+            )
+            return Int32(0)
+        except:
+            return Int32(-2)
+
+
+@export("marray_max_session_vertical_cape_gpu")
+def marray_max_session_vertical_cape_gpu(
+    handle: Int64,
+    upload_inputs: Int32,
+    copy_output: Int32,
+    h_tt: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_hu: ImmPointer[Float32, ImmUntrackedOrigin],
+    h_bmap: ImmPointer[UInt8, ImmUntrackedOrigin],
+    fill_val: Float32,
+    h_out_cape: MutPointer[Float32, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    comptime if not has_accelerator():
+        return Int32(-1)
+    else:
+        if handle == 0:
+            return Int32(-1)
+        try:
+            var ptr = MutPointer[CompiledMaxSession, MutUntrackedOrigin](
+                unsafe_from_address=Int(handle)
+            )
+            ptr[].exec_vertical_cape_gpu(
+                upload_inputs != 0,
+                copy_output != 0,
+                h_tt,
+                h_hu,
+                h_bmap,
+                fill_val,
+                h_out_cape,
+            )
+            return Int32(0)
+        except:
+            return Int32(-2)
+
+
+@export("marray_max_session_fst_decode_aether_gpu")
+def marray_max_session_fst_decode_aether_gpu(
+    handle: Int64,
+    h_raw_u: ImmPointer[UInt8, ImmUntrackedOrigin],
+    h_raw_v: ImmPointer[UInt8, ImmUntrackedOrigin],
+    h_raw_t: ImmPointer[UInt8, ImmUntrackedOrigin],
+    h_raw_bm: ImmPointer[UInt8, ImmUntrackedOrigin],
+    extrap_val: Float64,
+    h_csr_out_f64: MutPointer[Float64, MutUntrackedOrigin],
+) abi("C") -> Int32:
+    comptime if not has_accelerator():
+        return Int32(-1)
+    else:
+        if handle == 0:
+            return Int32(-1)
+        try:
+            var ptr = MutPointer[CompiledMaxSession, MutUntrackedOrigin](
+                unsafe_from_address=Int(handle)
+            )
+            ptr[].exec_fst_decode_and_aether_csr_gpu(
+                h_raw_u, h_raw_v, h_raw_t, h_raw_bm, extrap_val, h_csr_out_f64
+            )
+            return Int32(0)
+        except:
+            return Int32(-2)
 
 
 def py_engine_info() raises -> PythonObject:

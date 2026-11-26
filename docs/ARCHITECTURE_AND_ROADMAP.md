@@ -163,7 +163,8 @@ flowchart TD
 | :--- | :--- |
 | [`src/marray/morsel.mojo`](../src/marray/morsel.mojo) | 64-byte aligned `MorselReg` (`Float32`) & `MorselReg64` (`Float64`), single-pass span decoders (incl. native `MSRC_FST_BITMAP_F32` `float32` `0/1` `@@` planes), 4-way unrolled SIMD math, and 64-element bitmask word-skipping `ReduceAcc` kernels. |
 | [`src/marray/catalog.mojo`](../src/marray/catalog.mojo) | M1 separate-`.so` C-ABI `ChunkDecoder` (`ChunkDecoderCABI`), `is_datyp_parallel_safe` (`datyp=6` guard), whole-record `PlaneSlotCache` (1 decode/plane on regional slices), and reference `datyp=134` / `datyp=2` codecs. |
-| [`src/marray/vertical.mojo`](../src/marray/vertical.mojo) | L1d-resident `TILE_COLS = 64` `(column, level)` vertical physics scheduler matching `cmc_postproc_kernels` (`lift_columns` / `vertical_scan_columns`) with zero 4D cube transpose. |
+| [`src/marray/vertical.mojo`](../src/marray/vertical.mojo) | L1d-resident `TILE_COLS = 64` `TileTensor` `(column, level)` vertical physics scheduler matching `cmc_postproc_kernels` (`lift_columns` / `vertical_scan_columns`) with zero 4D cube transpose. |
+| [`src/marray/tensor_layout_ops.mojo`](../src/marray/tensor_layout_ops.mojo) | Additive `TileTensor` + `TensorLayout` (`col_major` Fortran & `row_major` Boreal) 2D stencils, static `vectorize[W]` CPU kernels, and persistent `CompiledMaxSession` (`max.gpu` `DeviceContext` + pre-staged `aether` CSR weights on VRAM). |
 | [`src/marray/vm.mojo`](../src/marray/vm.mojo) | 24-opcode general bytecode ISA, 3-pass multi-sink compiler (`compile_and_optimize_multi_dag`), `execute_multi_sink_plan`, spatial-partitioned high-rank axis reductions, and `execute_bytecode_plan_f64`. |
 | [`src/marray_mojo.mojo`](../src/marray_mojo.mojo) | Shared-library entrypoint exporting `PyInit_marray_mojo` (`PythonModuleBuilder`) plus zero-GIL C-ABI entrypoints (`marray_exec_multi_sink_plan`, `marray_exec_general_plan_f64`, `marray_exec_vertical_column_scan`, `marray_builtin_fst_chunk_decoder`). |
 | [`python/marray_xr/`](../python/marray_xr/__init__.py) | `Dataset`/`DataArray`/`Variable`, [`catalog.py`](../python/marray_xr/catalog.py) (`open_fst_catalog`, cross-`vctype` `from_sources`), [`duck.py`](../python/marray_xr/duck.py) (M4 `MarrayDuckArray`, `open_fst_xarray`), `compute_many`, `to_aether_flat`, `rmse_f64`, and `stream_write_fst`. |
@@ -266,9 +267,19 @@ You do **not** have to rewrite Xarray's plotting, NetCDF/Zarr export, or `repr` 
 * Xarray natively wraps any duck array implementing `__array_ufunc__`, `__array_function__`, or the **Python Array API standard (`__array_namespace__`)** (the exact mechanism `cubed` and `pint` use inside Xarray).
 * Wrapping `marray_xr.DataArray` as an Xarray duck-array backend (`xr.open_dataset("run.fstd", engine="marray_mojo")`) lets scientists use **100% standard `xarray.Dataset`** (including `hvplot`, `matplotlib`, `cartopy`, CF metadata, and `datetime64` indexes!) while `marray_mojo` intercepts lazy math, slices, masks, and `.compute()`—completely bypassing Dask!
 
-### 7.3 Optional GPU Offload via `TileTensor` & `max.gpu`
-For compute-dense diagnostics (3D moist thermodynamics, iterative wet-bulb/equivalent potential temperature $\theta_e$, spectral/FFT filtering, or 100-member ensemble covariances) on machines with an NVIDIA/AMD/Apple GPU:
-* Because `CompiledPlan` is already a compact, pointer-free register bytecode array and `UInt64` bitmasks map cleanly onto 32-lane GPU warps (`1 UInt64 = 2 warps`), the exact same `CompiledPlan` can dispatch to a generic Mojo GPU kernel (`mojo-gpu-fundamentals` skill) using `DeviceContext` + pinned host ring buffers.
+### 7.3 Empirical Proof: `TileTensor` / `TensorLayout`, Static Compilation & GPU (`bench_tensorlayout_and_gpu.py`)
+
+[`benchmarks/bench_tensorlayout_and_gpu.py`](../benchmarks/bench_tensorlayout_and_gpu.py) benchmarks [`src/marray/tensor_layout_ops.mojo`](../src/marray/tensor_layout_ops.mojo) (`TileTensor` `col_major` Fortran & `row_major` Boreal + `std.algorithm.vectorize[W]` + persistent `CompiledMaxSession` on `NVIDIA GeForce RTX 5080` vs. 16-thread Ryzen 7 5800X CPU, all `assert_allclose` verified):
+
+| Proof Workload (`grtyp=U` `16 × 10 × 606 × 540`) | Dask `column` HLG | 16T CPU (`marray`) | GPU End-to-End (incl. PCIe) | GPU Warm In-VRAM (`TileTensor`) | Architectural Finding |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Proof 1:** 2D Vorticity Stencil (`dv/dx - du/dy` + 5-pt `@@` mask dilation) | `597.64 ms` | **`62.77 ms`** (`row_major`) / **`62.73 ms`** (`col_major` F) | **`47.96 ms`** (`12.5×` vs Dask) | **`1.759 ms`** (**`35.7×` vs CPU**, **`340×` vs Dask**) | `TileTensor` handles Fortran `(ni,nj,ns)` & Boreal `(ns,nj,ni)` at identical speed with zero transpose and 1-pass stencil fusion. |
+| **Proof 2:** Morsel Bytecode VM vs. Static AOT Kernel (`Humidex + WindModulus`) | `954.81 ms` | **`117.82 ms`** (VM, `5 µs` JIT) vs `129.70 ms` (flat AOT) | `190.70 ms` *(1.26 GB raw PCIe)* | **`1.639 ms`** (**`79.1×` vs CPU**, **`583×` vs Dask**) | **Zero interpreter penalty on CPU**: 2048-elem morsel dispatch + 64-bit word skipping beats flat AOT. Uncompressed 1-pass PCIe transfers lose; multi-op VRAM residency wins `79×`. |
+| **Proof 3A:** 4D Coalesced Vertical `CAPE` Parcel Lift | `1,088.62 ms` *(Py peel+T)* | **`143.60 ms`** (`TILE_COLS=64`) | **`54.85 ms`** (**`2.6×` vs CPU**) | **`0.614 ms`** (**`233.7×` vs CPU**, **`1,772×` vs Py**) | Coalesced `x = global_idx.x` 4D `TileTensor` threads read across `z` with zero transpose, beating CPU even with cold PCIe transfers. |
+| **Proof 3B:** Compressed `datyp=134` + `@@` → Unpack → `UV` → `aether` CSR `(4, 65536)` | `> 25 ms` | **`26.170 ms`** | **`0.699 ms`** (**`37.5×` vs CPU**) | — | **Killer `mogc-api` / `polaris` pattern**: upload `2 MB` compressed FST records to persistent session (`294 ms` one-time init), decompress + mask + `aether` CSR SpMV in VRAM, return compact tile in **`0.70 ms`**. |
+
+> [!IMPORTANT]
+> **`DevicePassable` Rule for `TileTensor` GPU Kernels (`Mojo 1.2` + `MAX 26.7`):** Target-width `Int` and `UInt` intentionally do **not** conform to `DevicePassable` in `ctx.enqueue_function`. Always construct GPU `TileTensor` dynamic shapes with fixed-width `Int32` tuples (`row_major((Int32(nj), Int32(ni)))` / `col_major((Int32(ni), Int32(nj)))`) and type scalar kernel bounds as `Int32` / `Int64`.
 
 ---
 

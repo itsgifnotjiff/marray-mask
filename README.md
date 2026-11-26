@@ -23,6 +23,17 @@ Verified with `assert_allclose` (including `< 1e-12` relative IEEE-754 `float64`
 | **B7:** `boreal-postproc` Vertical Column Scan (`TILE_COLS=64` vs 4D transpose) | — | — | `1,088.62 ms` (`419 MB` copy) | **`116.14 ms`** | **`9.4×` faster** (zero 4D transpose) |
 | **B8:** `aether` Batched `(4, 327240)` Finite Prep + `mogc-api` 8-Thread Warmup | — | `20.21 ms` / `132.1 ms` | — | **`0.547 ms`** / **`6.68 ms`** | **`36.9×` `aether` prep** / **`19.8×` 8T warmup** |
 
+### `TileTensor` / `TensorLayout` & Compiled MAX/GPU Proof Suite ([`bench_tensorlayout_and_gpu.py`](benchmarks/bench_tensorlayout_and_gpu.py))
+
+Additive `TileTensor` (`col_major` Fortran & `row_major` Boreal) + `vectorize[W]` + persistent `CompiledMaxSession` (`max.gpu` `DeviceContext` on RTX 5080, `assert_allclose` verified):
+
+| Proof Workload (`16×10×606×540` `grtyp=U`) | Dask `column` HLG | 16T CPU (`marray`) | GPU End-to-End (incl. PCIe) | GPU Warm In-VRAM (`TileTensor`) | Key Takeaway |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **P1:** 2D Vorticity Stencil (`col_major` F & `row_major` C + 5-pt `@@` mask) | `597.64 ms` | **`62.73 ms`** (`F` & `C`) | **`47.96 ms`** | **`1.759 ms`** (**`340×` vs Dask**) | Zero transpose on Fortran & Boreal; 1-pass stencil |
+| **P2:** Bytecode VM (`117.8 ms`) vs. Static Compiled (`Humidex + WindModulus`) | `954.81 ms` | **`117.82 ms`** (VM) / `129.7 ms` (AOT) | `190.70 ms` *(1.26 GB PCIe)* | **`1.639 ms`** (**`583×` vs Dask**) | CPU morsel VM has **0% interpreter penalty**; don't ship uncompressed cubes over PCIe for 1 pass |
+| **P3A:** 4D Coalesced Vertical `CAPE` Parcel Lift | `1,088.62 ms` *(Py)* | **`143.60 ms`** | **`54.85 ms`** (**`2.6×` vs CPU**) | **`0.614 ms`** (**`234×` vs CPU**) | Compute-dense physics wins even with full PCIe transfer |
+| **P3B:** Compressed `datyp=134` + `@@` → Unpack → `UV` → `aether` CSR `(4, 65536)` | `> 25 ms` | **`26.17 ms`** | **`0.699 ms`** (**`37.5×` vs CPU**) | — | **Sub-ms `mogc-api` graph**: ship `2 MB` compressed bytes over PCIe, keep unpack + CSR in VRAM |
+
 *(On raw quantized `uint16` full-cube benchmarks in [`bench_mojo_vs_dask_xarray.py`](benchmarks/bench_mojo_vs_dask_xarray.py), single-pass decode + L1 morsel fusion reaches **`49.89 ms` (`28.9 GB/s` physical DRAM read)** vs `5,025 ms` in Dask [`100.7×`] and `7,863 ms` in `numpy.ma` [`157.6×`].)*
 
 ---
@@ -37,6 +48,7 @@ pixi install
 pixi run test            # 6 Mojo std.testing.TestSuite unit tests (incl. catalog & vertical tiles)
 pixi run synth-bench     # Standalone Mojo Tier-1 grtyp (U/O/Z/L/G/N/M) fill+decode demo
 pixi run bench-boreal    # Realistic Boreal/Aether B1-B8 suite (M1 catalog, M4 duck array, aether, stat)
+pixi run bench-max       # Proof suite: TileTensor (col_major/row_major), VM vs AOT, & GPU/MAX session
 pixi run bench-vs-dask   # General 4-way Mojo VM vs NumPy.ma vs Xarray vs Dask benchmark
 ```
 

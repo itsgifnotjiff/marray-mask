@@ -25,6 +25,7 @@ from std.memory import (
 from std.runtime import parallelism_level
 from std.sys import size_of
 from max.algorithm import parallelize
+from layout import ImmTileTensor, MutTileTensor, TensorLayout, TileTensor, row_major
 
 from .morsel import CACHE_ALIGN
 
@@ -81,42 +82,43 @@ struct ColumnTileScratch(Movable):
 
 
 @inline(.always)
-def _eval_builtin_column_kernel(
+def _eval_builtin_column_kernel[
+    LT: TensorLayout
+](
     mode: Int,
-    tt_cols: ImmPointer[Float32, _],
-    hu_cols: ImmPointer[Float32, _],
+    tt_cols: ImmTileTensor[DType.float32, LT, _],
+    hu_cols: ImmTileTensor[DType.float32, LT, _],
     has_hu: Bool,
-    valid_u8: ImmPointer[UInt8, _],
+    valid_u8: ImmTileTensor[DType.uint8, LT, _],
     levels_f32: ImmPointer[Float32, _],
     n_cols: Int,
     nk: Int,
     out_fill: Float32,
     out_cols: MutPointer[Float32, _],
 ):
-    """Run stateful vertical column scan over `n_cols` packed `(column, level)` slices."""
+    """Run stateful vertical column scan over `TileTensor` `(column, level)` slices."""
+    comptime assert tt_cols.flat_rank == 2 and hu_cols.flat_rank == 2 and valid_u8.flat_rank == 2
     for c in range(n_cols):
-        var c_base = c * nk
         if mode == VCOL_COLUMN_MAX:
             var best = Float32(-1.0e30)
             var any_v = False
             for z in range(nk):
-                if valid_u8[unsafe_offset=c_base + z] != UInt8(0):
-                    best = max(best, tt_cols[unsafe_offset=c_base + z])
+                if rebind[UInt8](valid_u8[c, z]) != UInt8(0):
+                    best = max(best, rebind[Float32](tt_cols[c, z]))
                     any_v = True
             out_cols[unsafe_offset=c] = best if any_v else out_fill
         elif mode == VCOL_HYPSOMETRIC_INTEGRAL:
-            # Geopotential thickness `R_d / g0 * integral(T_v d(ln p))` across valid column layers:
             var dz_sum = Float32(0.0)
             var valid_layers = 0
             for z in range(nk - 1):
-                var v0 = valid_u8[unsafe_offset=c_base + z] != UInt8(0)
-                var v1 = valid_u8[unsafe_offset=c_base + z + 1] != UInt8(0)
+                var v0 = rebind[UInt8](valid_u8[c, z]) != UInt8(0)
+                var v1 = rebind[UInt8](valid_u8[c, z + 1]) != UInt8(0)
                 if v0 and v1:
-                    var t0 = tt_cols[unsafe_offset=c_base + z] + Float32(273.15)
-                    var t1 = tt_cols[unsafe_offset=c_base + z + 1] + Float32(273.15)
+                    var t0 = rebind[Float32](tt_cols[c, z]) + Float32(273.15)
+                    var t1 = rebind[Float32](tt_cols[c, z + 1]) + Float32(273.15)
                     if has_hu:
-                        var q0 = hu_cols[unsafe_offset=c_base + z] * Float32(0.001)
-                        var q1 = hu_cols[unsafe_offset=c_base + z + 1] * Float32(0.001)
+                        var q0 = rebind[Float32](hu_cols[c, z]) * Float32(0.001)
+                        var q1 = rebind[Float32](hu_cols[c, z + 1]) * Float32(0.001)
                         t0 = fma(t0, Float32(0.608) * q0, t0)
                         t1 = fma(t1, Float32(0.608) * q1, t1)
                     var p0 = max(Float32(1.0), levels_f32[unsafe_offset=z])
@@ -126,19 +128,16 @@ def _eval_builtin_column_kernel(
                     valid_layers += 1
             out_cols[unsafe_offset=c] = dz_sum if valid_layers > 0 else out_fill
         else:
-            # `VCOL_CAPE_PARCEL_PROXY` (`lift_columns` stateful upward parcel buoyancy scan):
-            # Launches surface/lowest unmasked parcel `(T_sfc, q_sfc)` and integrates positive
-            # virtual temperature buoyancy along moist-adiabatic lapse across `z = 0..nk-1`!
             var launched = False
             var theta_e_p = Float32(0.0)
             var p_launch = Float32(1000.0)
             var cape = Float32(0.0)
             for z in range(nk):
-                if valid_u8[unsafe_offset=c_base + z] == UInt8(0):
+                if rebind[UInt8](valid_u8[c, z]) == UInt8(0):
                     continue
-                var t_env_k = tt_cols[unsafe_offset=c_base + z] + Float32(273.15)
+                var t_env_k = rebind[Float32](tt_cols[c, z]) + Float32(273.15)
                 var q_env = (
-                    hu_cols[unsafe_offset=c_base + z] * Float32(0.001)
+                    rebind[Float32](hu_cols[c, z]) * Float32(0.001)
                     if has_hu
                     else Float32(0.008)
                 )
@@ -146,12 +145,10 @@ def _eval_builtin_column_kernel(
                 if not launched:
                     launched = True
                     p_launch = p_z
-                    # Equivalent potential temperature proxy at launch level:
                     theta_e_p = t_env_k + Float32(2500.0) * q_env
                 else:
                     var p_prev = max(Float32(10.0), levels_f32[unsafe_offset=z - 1])
                     var dlnp = log(max(p_prev, p_z) / min(p_prev, p_z))
-                    # Moist parcel cooling rate vs environment:
                     var ratio = p_z / p_launch
                     var t_parcel = theta_e_p * exp(Float32(0.2854) * log(max(Float32(0.05), ratio)))
                     var buoy = (t_parcel - t_env_k) / max(Float32(180.0), t_env_k)
@@ -206,24 +203,29 @@ def execute_vertical_column_scan(
             var n_cols = min(TILE_COLS, n_pts - col_start)
             var cube_t_base = t_idx * nk * n_pts
 
-            # Gather `n_cols` across `z = 0..nk-1` and pack in-register into `(column, level)`!
+            var tile_lay = row_major((Int32(n_cols), Int32(nk)))
+            var tt_t = TileTensor(tt_tile, tile_lay)
+            var hu_t = TileTensor(hu_tile, tile_lay)
+            var vm_t = TileTensor(vm_tile, tile_lay)
+            comptime assert tt_t.flat_rank == 2 and hu_t.flat_rank == 2 and vm_t.flat_rank == 2
+
+            # Gather `n_cols` across `z = 0..nk-1` into L1d `TileTensor` `(column, level)`!
             for z in range(nk):
                 var plane_off = cube_t_base + z * n_pts + col_start
                 for c in range(n_cols):
-                    var dst_idx = c * nk + z
-                    tt_tile[unsafe_offset=dst_idx] = tt_f32[unsafe_offset=plane_off + c]
+                    tt_t[c, z] = rebind[tt_t.ElementType](tt_f32[unsafe_offset=plane_off + c])
                     if has_hu:
-                        hu_tile[unsafe_offset=dst_idx] = hu_f32[unsafe_offset=plane_off + c]
+                        hu_t[c, z] = rebind[hu_t.ElementType](hu_f32[unsafe_offset=plane_off + c])
                     if bmap_kind == 0:
-                        vm_tile[unsafe_offset=dst_idx] = UInt8(1)
+                        vm_t[c, z] = rebind[vm_t.ElementType](UInt8(1))
                     elif bmap_kind == 1:
-                        vm_tile[unsafe_offset=dst_idx] = (
+                        vm_t[c, z] = rebind[vm_t.ElementType](
                             UInt8(1)
                             if bmap_ptr[unsafe_offset=plane_off + c] > UInt8(0)
                             else UInt8(0)
                         )
                     else:
-                        vm_tile[unsafe_offset=dst_idx] = (
+                        vm_t[c, z] = rebind[vm_t.ElementType](
                             UInt8(1)
                             if bmap_f32[unsafe_offset=plane_off + c] > Float32(0.0)
                             else UInt8(0)
@@ -246,10 +248,10 @@ def execute_vertical_column_scan(
             else:
                 _eval_builtin_column_kernel(
                     kernel_mode,
-                    tt_tile,
-                    hu_tile,
+                    tt_t.as_imm(),
+                    hu_t.as_imm(),
                     has_hu,
-                    vm_tile,
+                    vm_t.as_imm(),
                     levels_f32,
                     n_cols,
                     nk,

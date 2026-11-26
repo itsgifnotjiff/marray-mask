@@ -1790,9 +1790,16 @@ from .duck import (  # noqa: E402
     open_fst_xarray,
     wrap_dataset_as_xarray,
 )
+from .max_compiled import (  # noqa: E402
+    CompiledMaxSession,
+    compiled_humidex_wind_cpu,
+    has_gpu_accelerator,
+    vorticity_stencil_cpu,
+)
 
 __all__ = [
     "CatalogVarSpec",
+    "CompiledMaxSession",
     "DataArray",
     "Dataset",
     "FST_MASK_FILL",
@@ -1800,10 +1807,12 @@ __all__ = [
     "PackedFSTArchive",
     "SinkSpec",
     "Variable",
+    "compiled_humidex_wind_cpu",
     "compute_many",
     "from_sources",
     "get_builtin_decoder_addr",
     "get_mojo_lib",
+    "has_gpu_accelerator",
     "open_fst_catalog",
     "open_fst_xarray",
     "pack_boreal_fst_archive",
@@ -1812,5 +1821,6 @@ __all__ = [
     "synth_boreal_raw_arenas",
     "to_aether_flat",
     "vertical_column_scan",
+    "vorticity_stencil_cpu",
     "wrap_dataset_as_xarray",
 ]

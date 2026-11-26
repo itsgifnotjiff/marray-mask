@@ -97,3 +97,8 @@ from .vertical import (
     VerticalColumnKernelCABI,
     execute_vertical_column_scan,
 )
+from .tensor_layout_ops import (
+    CompiledMaxSession,
+    exec_compiled_humidex_wind_cpu,
+    exec_vorticity_stencil_cpu,
+)

@@ -7,6 +7,7 @@ Follows Modular `mojo-syntax` and `idiomatic-mojo` guidelines:
   - Single-pass raw source decoding + 64-bit `UInt64` bitmask construction
 """
 
+from std.algorithm import vectorize
 from std.bit import pop_count
 from std.math import (
     abs,
@@ -317,23 +318,24 @@ def load_span_f32(
 
     if mask_kind == MSRC_NONE:
         if is_identity:
-            while k < vec_end:
-                dp.unsafe_store(dst_off + k, src_f32.unsafe_load[width=8](k))
-                k += 8
-            while k < span_len:
-                dp[unsafe_offset=dst_off + k] = src_f32[unsafe_offset=k]
-                k += 1
-        else:
-            while k < vec_end:
+            def _copy_vec[width: Int](idx: Int) {mut dp, imm src_f32, imm dst_off}:
                 dp.unsafe_store(
-                    dst_off + k, fma(src_f32.unsafe_load[width=8](k), sv, ov)
+                    dst_off + idx, src_f32.unsafe_load[width=width](idx)
                 )
-                k += 8
-            while k < span_len:
-                dp[unsafe_offset=dst_off + k] = fma(
-                    src_f32[unsafe_offset=k], scale, offset
+
+            vectorize[W](span_len, _copy_vec)
+        else:
+            def _fma_vec[width: Int](idx: Int) {mut dp, imm src_f32, imm dst_off, imm scale, imm offset}:
+                dp.unsafe_store(
+                    dst_off + idx,
+                    fma(
+                        src_f32.unsafe_load[width=width](idx),
+                        SIMD[.float32, width](scale),
+                        SIMD[.float32, width](offset),
+                    ),
                 )
-                k += 1
+
+            vectorize[W](span_len, _fma_vec)
         return
 
     if mask_kind == MSRC_NAN:
@@ -1190,25 +1192,21 @@ def morsel_store_filled(
     var sp = reg.data_imm()
 
     if reg.state == MSTATE_MASKED:
-        var vec_end = (count // 8) * 8
-        var k = 0
-        while k < vec_end:
-            dst_f32.unsafe_store(dst_off + k, fv)
-            k += 8
-        while k < count:
-            dst_f32[unsafe_offset=dst_off + k] = fill_value
-            k += 1
+        def _fill_masked[width: Int](idx: Int) {imm dst_f32, imm dst_off, imm fill_value}:
+            dst_f32.unsafe_store(
+                dst_off + idx, SIMD[.float32, width](fill_value)
+            )
+
+        vectorize[W](count, _fill_masked)
         return
 
     if reg.state == MSTATE_VALID:
-        var vec_end = (count // 8) * 8
-        var k = 0
-        while k < vec_end:
-            dst_f32.unsafe_store(dst_off + k, sp.unsafe_load[width=8](k))
-            k += 8
-        while k < count:
-            dst_f32[unsafe_offset=dst_off + k] = sp[unsafe_offset=k]
-            k += 1
+        def _store_valid[width: Int](idx: Int) {imm dst_f32, imm sp, imm dst_off}:
+            dst_f32.unsafe_store(
+                dst_off + idx, sp.unsafe_load[width=width](idx)
+            )
+
+        vectorize[W](count, _store_valid)
         return
 
     var mp = reg.mask_imm()

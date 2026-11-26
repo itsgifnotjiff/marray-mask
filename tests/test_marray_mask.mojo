@@ -35,6 +35,7 @@ from marray import (
     pack_bmap_plane_datyp2_1bit,
     pack_f32_plane_datyp134,
     execute_vertical_column_scan,
+    exec_vorticity_stencil_cpu,
 )
 from marray.morsel import (
     MSRC_FST_BITMAP_F32,
@@ -369,6 +370,59 @@ def test_catalog_datyp134_float32_bitmap_and_vertical_tiles() raises:
     )
     assert_true(out_cape[0] > Float32(0.0))
     assert_almost_equal(Float64(out_cape[0]), Float64(out_cape[69]), atol=1e-4)
+
+    # Verify layout-polymorphic `TileTensor` 2D Vorticity Stencil on BOTH Fortran
+    # `col_major((ni, nj, ns))` AND Boreal `row_major((ns, nj, ni))`!
+    var s_ni = 11
+    var s_nj = 9
+    var s_tot = s_ni * s_nj
+    var u_plane = List[Float32](capacity=s_tot)
+    var v_plane = List[Float32](capacity=s_tot)
+    var bm_plane = List[UInt8](capacity=s_tot)
+    # Solid-body linear shear `u = -2*y, v = 3*x` -> exact vorticity `dv/dx - du/dy = 3 - (-2) = 5.0`!
+    for j in range(s_nj):
+        for i in range(s_ni):
+            u_plane.append(Float32(-2.0) * Float32(j))
+            v_plane.append(Float32(3.0) * Float32(i))
+            bm_plane.append(UInt8(0) if (i == 5 and j == 4) else UInt8(1))
+
+    var out_c = List[Float32](capacity=s_tot)
+    out_c.resize(s_tot, Float32(0.0))
+    var out_f = List[Float32](capacity=s_tot)
+    out_f.resize(s_tot, Float32(0.0))
+
+    exec_vorticity_stencil_cpu(
+        ImmPointer[Float32, origin_of(u_plane)](u_plane.unsafe_ptr()),
+        ImmPointer[Float32, origin_of(v_plane)](v_plane.unsafe_ptr()),
+        ImmPointer[UInt8, origin_of(bm_plane)](bm_plane.unsafe_ptr()),
+        1,
+        s_nj,
+        s_ni,
+        False,
+        Float32(0.5),
+        Float32(0.5),
+        Float32(-999.0),
+        out_c.unsafe_ptr(),
+    )
+    exec_vorticity_stencil_cpu(
+        ImmPointer[Float32, origin_of(u_plane)](u_plane.unsafe_ptr()),
+        ImmPointer[Float32, origin_of(v_plane)](v_plane.unsafe_ptr()),
+        ImmPointer[UInt8, origin_of(bm_plane)](bm_plane.unsafe_ptr()),
+        1,
+        s_nj,
+        s_ni,
+        True,
+        Float32(0.5),
+        Float32(0.5),
+        Float32(-999.0),
+        out_f.unsafe_ptr(),
+    )
+    # Unmasked interior cell `(2, 2)` -> exact vorticity `5.0`, and both layouts match bit-for-bit!
+    assert_almost_equal(Float64(out_c[2 * s_ni + 2]), 5.0, atol=1e-5)
+    assert_almost_equal(Float64(out_f[2 + 2 * s_ni]), 5.0, atol=1e-5)
+    # 5-point mask dilation around `(5, 4)` masks `(5, 4)`, `(4, 4)`, `(6, 4)`, `(5, 3)`, `(5, 5)`!
+    assert_almost_equal(Float64(out_c[4 * s_ni + 4]), -999.0, atol=1e-5)
+    assert_almost_equal(Float64(out_f[4 + 4 * s_ni]), -999.0, atol=1e-5)
 
 
 def main() raises:

@@ -21,3 +21,4 @@ synth-bench = "mojo run -O3 -I src src/synth_bench_demo.mojo"
 build-ext = "bash -c 'mkdir -p build && mojo build -O3 --emit shared-lib -I src src/marray_mojo.mojo -o build/marray_mojo.so'"
 bench-vs-dask = { cmd = "python -u benchmarks/bench_mojo_vs_dask_xarray.py", depends-on = ["build-ext"] }
 bench-boreal = { cmd = "python -u benchmarks/bench_boreal_realistic.py", depends-on = ["build-ext"] }
+bench-max = { cmd = "python -u benchmarks/bench_tensorlayout_and_gpu.py", depends-on = ["build-ext"] }
