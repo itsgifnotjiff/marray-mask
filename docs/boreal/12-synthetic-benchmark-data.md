@@ -80,6 +80,35 @@ n_cells = materialize_var_cube(spec, axes, VAR_UU, scratch, out_f32, out_mask_wo
 
 Metrics: wall ms, effective GB/s of decoded f32, `masked_fraction` from `slab_reduce_stats`.
 
+## Real-FST hybrid bench (sibling to synth)
+
+Synthetic B1–B8 stay the published in-RAM / re-packed reference numbers. On an HPC
+work machine with boreal-io (`cmc-io`) and mounted ops suites, a **separate** hybrid
+bench exercises live GDPS `pres` decode:
+
+| Piece | Role |
+|-------|------|
+| [`benchmarks/fst_real_load.py`](../../benchmarks/fst_real_load.py) | Soft-import boreal-io; `open_fst` → synth-shaped arenas; `pack_decoded_archive` for M1 |
+| [`benchmarks/bench_fst_real.py`](../../benchmarks/bench_fst_real.py) | Phase-0 decode timing + R-B2 / R-B4 compute + R-B6 `open_fst_catalog` |
+| [`scripts/pbs/bench_fst_real.sh`](../../scripts/pbs/bench_fst_real.sh) | `ord_soumet -mach ppp8` runner (`MARRAY_ALLOW_LOGIN=1` for vis smoke) |
+
+Env (required; never commit absolute suite/checkout paths):
+
+- `MARRAY_FST_PRES_ROOT` — GDPS-style `prog/pres` directory of FST leads
+- `MARRAY_CMC_IO` — boreal-io / `cmc-io` checkout (needs `cmc_io_fst_*.so`); or a relative `../cmc-io` sibling
+
+```bash
+export MARRAY_CMC_IO=... MARRAY_FST_PRES_ROOT=...
+pixi run bench-fst-real -- --smoke          # 1 lead, ≤8 levels
+pixi run bench-fst-real -- --leads 4 --mode both
+```
+
+**Decode vs catalog:** Phase 0 times real `cmc_io` `datyp=134` unpack. R-B6 re-packs
+decoded arenas with the **builtin** reference codec into `PackedFSTArchive` so
+`open_fst_catalog` / `PlaneSlotCache` run on real geometry — wiring the live
+`cmc_io_fst_data` symbol into `ChunkDecoderCABI` remains the ARCHITECTURE M1
+“next step on work machine” follow-on.
+
 ## Non-goals
 
 - Full 13-`grtyp` coverage; bit-identical librmn / ezscint remaps.
