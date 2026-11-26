@@ -36,6 +36,7 @@ from .morsel import (
     load_span_f32,
     load_span_u16,
     morsel_accumulate_stats,
+    morsel_accumulate_weighted,
     morsel_add,
     morsel_affine,
     morsel_div,
@@ -47,6 +48,7 @@ from .morsel import (
     morsel_min,
     morsel_mul,
     morsel_pow2_sum,
+    morsel_store_filled,
     morsel_sub,
     morsel_unary_math,
 )
@@ -402,20 +404,23 @@ def compile_and_optimize_dag(
 
 
 struct MorselWorkspace(Movable):
-    """Thread-local L1-cache register file + 1 disjoint scratch register."""
+    """Thread-local L1-cache register file + 1 disjoint scratch + 1 weight register."""
 
     var regs: List[MorselReg]
     var scratch: MorselReg
+    var wt_reg: MorselReg
 
     def __init__(out self, num_regs: Int):
         self.regs = List[MorselReg](capacity=num_regs)
         for _ in range(num_regs):
             self.regs.append(MorselReg())
         self.scratch = MorselReg()
+        self.wt_reg = MorselReg()
 
     def __init__(out self, *, deinit move: Self):
         self.regs = move.regs^
         self.scratch = move.scratch^
+        self.wt_reg = move.wt_reg^
 
 
 @inline(.always)
@@ -770,9 +775,10 @@ def execute_bytecode_plan(
     slice_stops: ImmPointer[Int64, _],
     reduce_axes_mask: Int,  # bit d == 1 means axis d is reduced; bit 0..3; -1 = scalar only
     agg_mode: Int,          # AGG_MEAN..AGG_COUNT; -1 = materialize full sliced array
+    weight_src_id: Int,     # >= 0 for single-pass area-weighted mean (`areacell` / `areacell_yy`)
+    out_fill_f32: Float32,  # `NaN` for in-memory Xarray/aether, `1e30` for `fst_mask_fill` write_fst
     out_stats_f64: MutPointer[Float64, _],  # [mean, std, min, max, sum, valid_cnt, total_cnt]
     out_arr_f32: MutPointer[Float32, _],
-    out_mask_u8: MutPointer[UInt8, _],
 ):
     """Execute any compiled bytecode DAG over a 1D..4D sliced domain in L1 morsels."""
     var d0_s = Int(slice_starts[unsafe_offset=0]) if ndim > 0 else 0
@@ -886,6 +892,8 @@ def execute_bytecode_plan(
     p_gval.resize(n_workers, 0)
     var p_gtot = List[Int](capacity=n_workers)
     p_gtot.resize(n_workers, 0)
+    var p_gwsum = List[Float64](capacity=n_workers)
+    p_gwsum.resize(n_workers, 0.0)
 
     var gsum_p = p_gsum.unsafe_ptr()
     var gsq_p = p_gsq.unsafe_ptr()
@@ -893,11 +901,13 @@ def execute_bytecode_plan(
     var gmax_p = p_gmax.unsafe_ptr()
     var gval_p = p_gval.unsafe_ptr()
     var gtot_p = p_gtot.unsafe_ptr()
+    var gwsum_p = p_gwsum.unsafe_ptr()
 
     var ws_p = w_sum.unsafe_ptr()
     var wsq_p = w_sq.unsafe_ptr()
     var wext_p = w_ext.unsafe_ptr()
     var wc_p = w_cnt.unsafe_ptr()
+    var use_weights = weight_src_id >= 0
 
     def worker(wid: Int) {imm}:
         var m_begin = (wid * n_morsels) // n_workers
@@ -908,6 +918,9 @@ def execute_bytecode_plan(
         # L1-cache resident morsel register file (typically 3..5 x 8KB = ~32KB!)
         var ws = MorselWorkspace(num_regs)
         var local_acc = ReduceAcc()
+        var local_wx: Float64 = 0.0
+        var local_ww: Float64 = 0.0
+        var local_wcnt = 0
         var base_w = wid * out_cells
 
         for mid in range(m_begin, m_end):
@@ -934,20 +947,36 @@ def execute_bytecode_plan(
             )
 
             ref root = ws.regs[root_reg]
-            if want_sq:
+            if use_weights:
+                _load_morsel_from_source(
+                    srcs_ptr[unsafe_offset=weight_src_id],
+                    ndim,
+                    d0_s,
+                    d0_len,
+                    d1_s,
+                    d1_len,
+                    d2_s,
+                    d2_len,
+                    d3_s,
+                    d3_len,
+                    flat_off,
+                    cnt,
+                    coal_ptr[unsafe_offset=weight_src_id],
+                    ws.wt_reg,
+                )
+                morsel_accumulate_weighted(
+                    root, ws.wt_reg, cnt, local_wx, local_ww, local_wcnt
+                )
+                local_acc.total_count += cnt
+            elif want_sq:
                 morsel_accumulate_stats[True](root, cnt, local_acc)
             else:
                 morsel_accumulate_stats[False](root, cnt, local_acc)
 
             if materialize_direct and want_axis_out:
-                var dp = root.data_imm()
-                for k in range(cnt):
-                    var g_idx = flat_off + k
-                    var m_flag = root.is_masked(k)
-                    out_arr_f32[unsafe_offset=g_idx] = (
-                        0.0 if m_flag else dp[unsafe_offset=k]
-                    )
-                    out_mask_u8[unsafe_offset=g_idx] = UInt8(1) if m_flag else UInt8(0)
+                morsel_store_filled(
+                    root, out_arr_f32, flat_off, cnt, out_fill_f32
+                )
             elif want_axis_out and root.state != MSTATE_MASKED:
                 var dp = root.data_imm()
                 # Fast specialization when keeping inner 2D `(d0, d1)` & reducing `(d2, d3)`:
@@ -1007,35 +1036,61 @@ def execute_bytecode_plan(
                                 var cur_e = wext_p[unsafe_offset=o_idx]
                                 wext_p[unsafe_offset=o_idx] = min(cur_e, v) if agg_mode == AGG_MIN else max(cur_e, v)
 
-        gsum_p[unsafe_offset=wid] = local_acc.sum
-        gsq_p[unsafe_offset=wid] = local_acc.sum_sq
-        gmin_p[unsafe_offset=wid] = local_acc.min_val
-        gmax_p[unsafe_offset=wid] = local_acc.max_val
-        gval_p[unsafe_offset=wid] = local_acc.valid_count
-        gtot_p[unsafe_offset=wid] = local_acc.total_count
+        if use_weights:
+            gsum_p[unsafe_offset=wid] = local_wx
+            gwsum_p[unsafe_offset=wid] = local_ww
+            gval_p[unsafe_offset=wid] = local_wcnt
+            gtot_p[unsafe_offset=wid] = local_acc.total_count
+        else:
+            gsum_p[unsafe_offset=wid] = local_acc.sum
+            gsq_p[unsafe_offset=wid] = local_acc.sum_sq
+            gmin_p[unsafe_offset=wid] = local_acc.min_val
+            gmax_p[unsafe_offset=wid] = local_acc.max_val
+            gval_p[unsafe_offset=wid] = local_acc.valid_count
+            gtot_p[unsafe_offset=wid] = local_acc.total_count
 
     parallelize(worker, n_workers)
 
-    var final_acc = ReduceAcc()
-    for w in range(n_workers):
-        final_acc.merge(
-            ReduceAcc(
-                p_gsum[w],
-                p_gsq[w],
-                p_gmin[w],
-                p_gmax[w],
-                p_gval[w],
-                p_gtot[w],
-            )
+    if use_weights:
+        var tot_wx = 0.0
+        var tot_ww = 0.0
+        var tot_vc = 0
+        var tot_tc = 0
+        for w in range(n_workers):
+            tot_wx += p_gsum[w]
+            tot_ww += p_gwsum[w]
+            tot_vc += p_gval[w]
+            tot_tc += p_gtot[w]
+        out_stats_f64[unsafe_offset=0] = (
+            (tot_wx / tot_ww) if tot_ww > 0.0 else (0.0 / 0.0)
         )
+        out_stats_f64[unsafe_offset=1] = 0.0
+        out_stats_f64[unsafe_offset=2] = 0.0
+        out_stats_f64[unsafe_offset=3] = 0.0
+        out_stats_f64[unsafe_offset=4] = tot_wx
+        out_stats_f64[unsafe_offset=5] = Float64(tot_vc)
+        out_stats_f64[unsafe_offset=6] = Float64(tot_tc)
+    else:
+        var final_acc = ReduceAcc()
+        for w in range(n_workers):
+            final_acc.merge(
+                ReduceAcc(
+                    p_gsum[w],
+                    p_gsq[w],
+                    p_gmin[w],
+                    p_gmax[w],
+                    p_gval[w],
+                    p_gtot[w],
+                )
+            )
 
-    out_stats_f64[unsafe_offset=0] = final_acc.mean()
-    out_stats_f64[unsafe_offset=1] = final_acc.std()
-    out_stats_f64[unsafe_offset=2] = Float64(final_acc.min_val)
-    out_stats_f64[unsafe_offset=3] = Float64(final_acc.max_val)
-    out_stats_f64[unsafe_offset=4] = final_acc.sum
-    out_stats_f64[unsafe_offset=5] = Float64(final_acc.valid_count)
-    out_stats_f64[unsafe_offset=6] = Float64(final_acc.total_count)
+        out_stats_f64[unsafe_offset=0] = final_acc.mean()
+        out_stats_f64[unsafe_offset=1] = final_acc.std()
+        out_stats_f64[unsafe_offset=2] = Float64(final_acc.min_val)
+        out_stats_f64[unsafe_offset=3] = Float64(final_acc.max_val)
+        out_stats_f64[unsafe_offset=4] = final_acc.sum
+        out_stats_f64[unsafe_offset=5] = Float64(final_acc.valid_count)
+        out_stats_f64[unsafe_offset=6] = Float64(final_acc.total_count)
 
     if want_axis_out and not materialize_direct:
         for cell in range(out_cells):
@@ -1057,10 +1112,8 @@ def execute_bytecode_plan(
                         ext_v = max(ext_v, w_ext[off])
 
             if c_tot == 0 and agg_mode != AGG_COUNT:
-                out_arr_f32[unsafe_offset=cell] = 0.0
-                out_mask_u8[unsafe_offset=cell] = UInt8(1)
+                out_arr_f32[unsafe_offset=cell] = out_fill_f32
             else:
-                out_mask_u8[unsafe_offset=cell] = UInt8(0)
                 match agg_mode:
                     case == AGG_MEAN:
                         out_arr_f32[unsafe_offset=cell] = Float32(

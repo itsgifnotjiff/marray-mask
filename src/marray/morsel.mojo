@@ -59,11 +59,13 @@ comptime DTYPE_U8: Int = 5
 
 # General input mask encodings (CF-conventions / RPN / GRIB / NumPy ma):
 comptime MSRC_NONE: Int = 0
-comptime MSRC_SENTINEL_INT: Int = 1  # raw integer == sentinel_int
-comptime MSRC_NAN: Int = 2           # IEEE NaN in float32/float64 source
-comptime MSRC_BYTE_GT: Int = 3       # companion uint8 array > threshold_int
-comptime MSRC_BYTE_NE: Int = 4       # companion uint8 array != threshold_int (e.g. numpy.ma bool!=0)
-comptime MSRC_BITPACKED: Int = 5     # companion packed uint64 bitmask
+comptime MSRC_SENTINEL_INT: Int = 1       # raw integer == sentinel_int
+comptime MSRC_NAN: Int = 2                # IEEE NaN in float32/float64 source
+comptime MSRC_BYTE_GT: Int = 3            # companion uint8 array > threshold_int
+comptime MSRC_BYTE_NE: Int = 4            # companion uint8 array != threshold_int (e.g. numpy.ma bool!=0)
+comptime MSRC_BITPACKED: Int = 5          # companion packed uint64 bitmask (1 = masked)
+comptime MSRC_FST_BITMAP_U8: Int = 6      # fstd2nc / boreal-io @@ polarity: keep > 0, mask == 0
+comptime MSRC_FST_BITMAP_WORDS: Int = 7   # packed UInt64 @@ bitmap: bit 1 = valid, bit 0 = masked (~word)
 
 
 @inline(.always)
@@ -243,13 +245,18 @@ def load_span_u16(
             k += 1
         return
 
-    # MSRC_BYTE_GT or MSRC_BYTE_NE (e.g. QC flags or companion bool mask):
+    # MSRC_BYTE_GT, MSRC_BYTE_NE, or MSRC_FST_BITMAP_U8 (`== 0` masked):
     var is_gt = mask_kind == MSRC_BYTE_GT
+    var is_fst_zero = mask_kind == MSRC_FST_BITMAP_U8
+    var zero_u8 = SIMD[.uint8, 8](0)
     while k < vec_end:
         var q = src_u16.unsafe_load[width=8](k)
         var qf = aux_u8.unsafe_load[width=8](k)
-        dp.unsafe_store(dst_off + k, fma(q.cast[.float32](), sv, ov))
-        var is_m = qf.gt(qmax_v) if is_gt else qf.ne(qmax_v)
+        var is_m = qf.eq(zero_u8) if is_fst_zero else (
+            qf.gt(qmax_v) if is_gt else qf.ne(qmax_v)
+        )
+        var val = fma(q.cast[.float32](), sv, ov)
+        dp.unsafe_store(dst_off + k, is_m.select(zero_f, val))
         var bits8 = _pack_bool8(is_m)
         if bits8 != UInt64(0):
             or_bits |= bits8
@@ -262,14 +269,18 @@ def load_span_u16(
         k += 8
     while k < span_len:
         var d_idx = dst_off + k
-        dp[unsafe_offset=d_idx] = fma(
-            Float32(src_u16[unsafe_offset=k]), scale, offset
-        )
         var qfs = Int(aux_u8[unsafe_offset=k])
-        var bad = (qfs > mask_param) if is_gt else (qfs != mask_param)
+        var bad = (qfs == 0) if is_fst_zero else (
+            (qfs > mask_param) if is_gt else (qfs != mask_param)
+        )
         if bad:
+            dp[unsafe_offset=d_idx] = 0.0
             mp[unsafe_offset=d_idx >> 6] |= UInt64(1) << UInt64(d_idx & 63)
             or_bits |= UInt64(1)
+        else:
+            dp[unsafe_offset=d_idx] = fma(
+                Float32(src_u16[unsafe_offset=k]), scale, offset
+            )
         k += 1
 
 
@@ -351,13 +362,18 @@ def load_span_f32(
             k += 1
         return
 
-    # Companion byte mask (`MSRC_BYTE_GT` or `MSRC_BYTE_NE` for numpy.ma bool masks)
+    # Companion byte mask (`MSRC_BYTE_GT`, `MSRC_BYTE_NE`, or `MSRC_FST_BITMAP_U8` where 0=masked)
     var is_gt = mask_kind == MSRC_BYTE_GT
+    var is_fst_zero = mask_kind == MSRC_FST_BITMAP_U8
+    var zero_u8 = SIMD[.uint8, 8](0)
     while k < vec_end:
         var raw = src_f32.unsafe_load[width=8](k)
         var qf = aux_u8.unsafe_load[width=8](k)
-        dp.unsafe_store(dst_off + k, raw if is_identity else fma(raw, sv, ov))
-        var is_m = qf.gt(q_v) if is_gt else qf.ne(q_v)
+        var is_m = qf.eq(zero_u8) if is_fst_zero else (
+            qf.gt(q_v) if is_gt else qf.ne(q_v)
+        )
+        var val = raw if is_identity else fma(raw, sv, ov)
+        dp.unsafe_store(dst_off + k, is_m.select(zero_f, val))
         var bits8 = _pack_bool8(is_m)
         if bits8 != UInt64(0):
             or_bits |= bits8
@@ -371,12 +387,18 @@ def load_span_f32(
     while k < span_len:
         var rv = src_f32[unsafe_offset=k]
         var d_idx = dst_off + k
-        dp[unsafe_offset=d_idx] = rv if is_identity else fma(rv, scale, offset)
         var qfs = Int(aux_u8[unsafe_offset=k])
-        var bad = (qfs > mask_param) if is_gt else (qfs != mask_param)
+        var bad = (qfs == 0) if is_fst_zero else (
+            (qfs > mask_param) if is_gt else (qfs != mask_param)
+        )
         if bad:
+            dp[unsafe_offset=d_idx] = 0.0
             mp[unsafe_offset=d_idx >> 6] |= UInt64(1) << UInt64(d_idx & 63)
             or_bits |= UInt64(1)
+        else:
+            dp[unsafe_offset=d_idx] = rv if is_identity else fma(
+                rv, scale, offset
+            )
         k += 1
 
 
@@ -1010,3 +1032,166 @@ def morsel_accumulate_stats[
         acc.min_val = min(acc.min_val, mn0.reduce_min())
         acc.max_val = max(acc.max_val, mx0.reduce_max())
         acc.valid_count += valid_cnt
+
+
+@inline(.always)
+def morsel_accumulate_weighted(
+    val_reg: MorselReg,
+    wt_reg: MorselReg,
+    count: Int,
+    mut sum_wx: Float64,
+    mut sum_w: Float64,
+    mut valid_cnt: Int,
+):
+    """Single-pass area-weighted accumulation (`boreal-stat` `globavg` / `areacell_yy`).
+
+    Sums `val * w` and `w` simultaneously ONLY over lanes unmasked in both
+    `val_reg` and `wt_reg` (avoiding Xarray's 3-pass `da.weighted(w).mean()`!).
+    """
+    if count == 0 or val_reg.state == MSTATE_MASKED or wt_reg.state == MSTATE_MASKED:
+        return
+
+    var vp = val_reg.data_imm()
+    var wp = wt_reg.data_imm()
+    var zeros = SIMD[.float64, 8](0.0)
+
+    if val_reg.state == MSTATE_VALID and wt_reg.state == MSTATE_VALID:
+        var wx0 = SIMD[.float64, 8](0.0)
+        var wx1 = SIMD[.float64, 8](0.0)
+        var w0 = SIMD[.float64, 8](0.0)
+        var w1 = SIMD[.float64, 8](0.0)
+        var pair_end = (count // 16) * 16
+        var idx = 0
+        while idx < pair_end:
+            var v_a = vp.unsafe_load[width=8](idx).cast[.float64]()
+            var w_a = wp.unsafe_load[width=8](idx).cast[.float64]()
+            var v_b = vp.unsafe_load[width=8](idx + 8).cast[.float64]()
+            var w_b = wp.unsafe_load[width=8](idx + 8).cast[.float64]()
+            wx0 = fma(v_a, w_a, wx0)
+            wx1 = fma(v_b, w_b, wx1)
+            w0 += w_a
+            w1 += w_b
+            idx += 16
+        var swx = (wx0 + wx1).reduce_add()
+        var sw = (w0 + w1).reduce_add()
+        while idx < count:
+            var sv = Float64(vp[unsafe_offset=idx])
+            var sw_i = Float64(wp[unsafe_offset=idx])
+            swx = fma(sv, sw_i, swx)
+            sw += sw_i
+            idx += 1
+        sum_wx += swx
+        sum_w += sw
+        valid_cnt += count
+        return
+
+    var wx0 = SIMD[.float64, 8](0.0)
+    var w0 = SIMD[.float64, 8](0.0)
+    var n_words = ceildiv(count, 64)
+    var vmp = val_reg.mask_imm()
+    var wmp = wt_reg.mask_imm()
+    var has_vm = val_reg.state == MSTATE_BITS
+    var has_wm = wt_reg.state == MSTATE_BITS
+    var v_cnt = 0
+
+    for w in range(n_words):
+        var word: UInt64 = 0
+        if has_vm:
+            word |= vmp[unsafe_offset=w]
+        if has_wm:
+            word |= wmp[unsafe_offset=w]
+        if w == n_words - 1 and (count & 63) != 0:
+            word |= ~_trailing_mask(count)
+
+        if word == ALL_ONES:
+            continue
+        elif word == UInt64(0):
+            var base = w * 64
+            comptime for g in range(8):
+                var vv = vp.unsafe_load[width=8](base + g * 8).cast[.float64]()
+                var wv = wp.unsafe_load[width=8](base + g * 8).cast[.float64]()
+                wx0 = fma(vv, wv, wx0)
+                w0 += wv
+            v_cnt += 64
+        else:
+            var base = w * 64
+            v_cnt += 64 - Int(pop_count(word))
+            comptime for g in range(8):
+                var bm = UInt8((word >> UInt64(g * 8)) & UInt64(0xFF))
+                if bm != UInt8(0xFF):
+                    var vv = vp.unsafe_load[width=8](base + g * 8).cast[.float64]()
+                    var wv = wp.unsafe_load[width=8](base + g * 8).cast[.float64]()
+                    if bm == UInt8(0):
+                        wx0 = fma(vv, wv, wx0)
+                        w0 += wv
+                    else:
+                        var mv = _unpack_bool8(bm)
+                        var w_eff = mv.select(zeros, wv)
+                        wx0 = fma(mv.select(zeros, vv), w_eff, wx0)
+                        w0 += w_eff
+
+    sum_wx += wx0.reduce_add()
+    sum_w += w0.reduce_add()
+    valid_cnt += v_cnt
+
+
+@inline(.always)
+def morsel_store_filled(
+    reg: MorselReg,
+    dst_f32: MutPointer[Float32, _],
+    dst_off: Int,
+    count: Int,
+    fill_value: Float32,
+):
+    """SIMD store of `reg` into output array with `fill_value` (`NaN` or `1e30`)
+    substituted on masked lanes in a single pass (zero Python mask post-pass).
+    """
+    var fv = SIMD[.float32, 8](fill_value)
+    var sp = reg.data_imm()
+
+    if reg.state == MSTATE_MASKED:
+        var vec_end = (count // 8) * 8
+        var k = 0
+        while k < vec_end:
+            dst_f32.unsafe_store(dst_off + k, fv)
+            k += 8
+        while k < count:
+            dst_f32[unsafe_offset=dst_off + k] = fill_value
+            k += 1
+        return
+
+    if reg.state == MSTATE_VALID:
+        var vec_end = (count // 8) * 8
+        var k = 0
+        while k < vec_end:
+            dst_f32.unsafe_store(dst_off + k, sp.unsafe_load[width=8](k))
+            k += 8
+        while k < count:
+            dst_f32[unsafe_offset=dst_off + k] = sp[unsafe_offset=k]
+            k += 1
+        return
+
+    var mp = reg.mask_imm()
+    var n_words = ceildiv(count, 64)
+    for w in range(n_words):
+        var word = mp[unsafe_offset=w]
+        var base = w * 64
+        comptime for g in range(8):
+            var off = base + g * 8
+            if off + 8 <= count:
+                var v = sp.unsafe_load[width=8](off)
+                var bm = UInt8((word >> UInt64(g * 8)) & UInt64(0xFF))
+                if bm == UInt8(0):
+                    dst_f32.unsafe_store(dst_off + off, v)
+                elif bm == UInt8(0xFF):
+                    dst_f32.unsafe_store(dst_off + off, fv)
+                else:
+                    dst_f32.unsafe_store(
+                        dst_off + off, _unpack_bool8(bm).select(fv, v)
+                    )
+            elif off < count:
+                for lane in range(count - off):
+                    var idx = off + lane
+                    dst_f32[unsafe_offset=dst_off + idx] = (
+                        fill_value if reg.is_masked(idx) else sp[unsafe_offset=idx]
+                    )

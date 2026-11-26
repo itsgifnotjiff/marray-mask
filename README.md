@@ -2,21 +2,25 @@
 
 A high-performance **Mojo 1.2** masked array and lazy bytecode execution stack designed to replace Python's `NumPy.ma + Dask + Xarray` chunk-orchestration bottleneck on large ($10\text{ GB} \to 1\text{ PB+}$), Fortran-contiguous scientific datasets (modeled on ECCC's **GDPS** NWP archive).
 
-📖 **Deep-Dive Documentation:** See **[`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md)** for the full architectural design, roofline math, bytecode compiler internals, Mojo 1.2 subtleties, limitations audit, and M1–M6 production roadmap.
+📖 **Deep-Dive Documentation:**
+* **[`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md)** — Full architectural design, roofline math, bytecode compiler internals, realistic Boreal/Aether benchmarks, Mojo 1.2 subtleties, limitations audit, and M1–M6 roadmap.
+* **[`docs/boreal/`](docs/boreal/README.md)** — Cross-package contracts for `boreal-io` (`open_fst`, `@@` bitmaps, `column`/`record` HLG), `boreal-postproc`, `boreal-stat`, `aether`, `polaris`, and `mogc-api`.
 
 ---
 
-## Highlights & Verified Benchmark Numbers
+## Highlights & Realistic Boreal Stack Benchmarks
 
-Tested on identical pre-allocated Fortran-contiguous memory buffers (`800 × 401 × 20 × 25` ECCC GDPS cube, $1.44\text{ GB}$ raw / $5.13\text{ GB}$ logical `float32`, AMD Ryzen 7 5800X 16 threads, `NumPy 2.4.3`, `Xarray 2026.2.0`, `Dask 2026.3.0`, `Mojo 1.2.0 -O3`, verified `assert_allclose`):
+Tested against realistic `boreal-io` `HighLevelGraph` (`chunks="record"` and `chunks="column"`), `chunks=False` Eager Peel→NumPy→Rewrap, and Eager Xarray across all 7 Tier-1 RPN `grtyp` geometries (`U` Yin–Yang 53%, `O` Coastal 23%, `Z` Rotated 15%, `G` Gaussian 3%, `N` Polar Stereo 3%, `L` Lat-Lon 2%, `M` Mesh <1%) using C-contiguous `(time, vertical, y, x)` cubes and `fstd2nc`-polarity `@@` bitmaps (`keep > 0, mask == 0`, verified `assert_allclose` on Ryzen 7 5800X 16T):
 
-| Workload | Xarray + Dask (16T) | Eager Xarray (`NaN`) | NumPy (`numpy.ma`) | `marray_xr` (Mojo 1.2 VM) | Speedup vs. Dask |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Dataset / Graph Setup** (2,000 raw layers) | `2,566.48 ms` | `< 0.20 ms` | — | **`< 0.20 ms`** | **`> 12,000×`** |
-| **W1:** Regional `.sel()` + Moist Jet + 2D `(lon, lat)` Mean Map | `2,185.40 ms` | `30.39 ms` | `30.74 ms` | **`1.80 ms`** | **`1,216.9×`** (`17×` vs Xarray/NumPy) |
-| **W2:** Full Global Cube (All 2,000 slabs, $5.13\text{ GB}$ `float32`) | `5,025.17 ms` | `4,040.41 ms` | `7,863.24 ms` | **`49.89 ms`** | **`100.7×`** (`158×` vs `numpy.ma`) |
-| **W3:** Eddy Kinetic Energy `0.5*(U^2+V^2)` → `(lat, level)` Zonal Profile | `2,149.99 ms` | `2,249.43 ms` | — | **`179.18 ms`** | **`12.0×`** |
-| **W4:** 3D→4D Stride-0 Broadcast `TM - TT` (`mean` & `std`) | `829.69 ms` | — | — | **`10.32 ms`** | **`80.4×`** |
+| Realistic Boreal Suite (`benchmarks/bench_boreal_realistic.py`) | `record` HLG | `column` HLG (16T) | Eager Peel/Rewrap | `marray_xr` (Mojo 1.2 VM) | Speedup |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **B1:** `open_fst` Graph Assembly (80 leads × 40 lvls × 6 vars = 19,200 records) | `32.76 ms` | `1.62 ms` | — | **`0.012 ms`** | **`2,760×` vs `record`** (`137×` vs `column`) |
+| **B2:** `polaris` Thin 2D Peel (`grtyp=U` `606×540`, `WindModulus` → `aether` `(nj,ni)` buf) | `7.024 ms` | `31.841 ms` | — | **`0.858 ms`** | **`8.2×` vs `record`** (**`37.1×` vs `column`**) |
+| **B3:** `boreal-postproc` Spooki `Humidex` (`exp`) + Direct `1e30` (`fst_mask_fill`) Write Buf | — | `525.57 ms` | `635.69 ms` | **`60.43 ms`** | **`8.7×` vs `column`** (**`10.5×` vs Eager**) |
+| **B4:** `boreal-stat` `r.diag` (`ke` + Yin–Yang `areacell` Weighted `globavg` + `zonavg`) | — | `537.69 ms` | `549.57 ms` | **`84.88 ms`** | **`6.3×` vs `column`** (`6.5×` vs Eager) |
+| **B5:** Tier-1 `grtyp` Sweep (`U, O, Z, G, N, L, M` at `SynthGridSpec.large`) | `170–298 ms` | `147–313 ms` | `195–393 ms` | **`10.7–23.6 ms`** | **`11.9×–16.8×` vs `column` HLG** |
+
+*(On raw quantized `uint16` full-cube benchmarks in [`bench_mojo_vs_dask_xarray.py`](benchmarks/bench_mojo_vs_dask_xarray.py), single-pass decode + L1 morsel fusion reaches **`49.89 ms` (`28.9 GB/s` physical DRAM read)** vs `5,025 ms` in Dask [`100.7×`] and `7,863 ms` in `numpy.ma` [`157.6×`].)*
 
 ---
 
@@ -27,10 +31,10 @@ git clone git@github.com:itsgifnotjiff/marray-mask.git
 cd marray-mask
 
 pixi install
-pixi run test            # Mojo std.testing.TestSuite unit tests
-pixi run interop         # Bidirectional zero-copy Mojo <-> NumPy.ma / Xarray check
-pixi run demo            # Pure-Mojo 560 TB virtual GDPS catalog & slab benchmark
-pixi run bench-vs-dask   # Build build/marray_mojo.so & run 4-workload Dask/Xarray comparison
+pixi run test            # Mojo std.testing.TestSuite unit tests (incl. Tier-1 synth grids)
+pixi run synth-bench     # Standalone Mojo Tier-1 grtyp (U/O/Z/L/G/N/M) fill+decode demo
+pixi run bench-boreal    # Realistic Boreal/Aether suite (record/column HLG, peel-rewrap, U..M)
+pixi run bench-vs-dask   # General 4-way Mojo VM vs NumPy.ma vs Xarray vs Dask benchmark
 ```
 
 ## Example Usage (`python/marray_xr`)

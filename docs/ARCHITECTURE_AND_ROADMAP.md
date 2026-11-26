@@ -76,6 +76,43 @@ On dual-channel DDR4-3200/3600 ($\sim 35\text{–}42\text{ GB/s}$ theoretical pe
 2. **Single-Pass Decode + Bitmask Construction:** v0.1 scanned raw `uint16` slabs once to unpack floats and a second time whenever `any_sentinel` fired, doubling DRAM reads on low-level slabs. v0.2 packs 64-bit mask words in registers during the single load pass.
 3. **General CF Scale/Offset Folding:** Folding `* 0.514444` and `+ 273.15` into `SourceBinding` eliminated two full vector passes.
 
+### 2.3 Realistic Boreal & Aether Stack Benchmark (`benchmarks/bench_boreal_realistic.py`)
+
+Using the cross-package contracts in [`docs/boreal/`](boreal/README.md) and the Tier-1 operational `grtyp` synthesizer in [`src/marray/synth.mojo`](../src/marray/synth.mojo), [`benchmarks/bench_boreal_realistic.py`](../benchmarks/bench_boreal_realistic.py) tests `marray_xr` against the **exact production patterns** of `boreal-io`, `boreal-postproc`, `boreal-stat`, `polaris`, and `aether`:
+* **Cube layout:** C-contiguous `(time, vertical, y, x)` (`(n_t, n_z, nj, ni)`) over Fortran-linear `(ni, nj)` plane bytes (`x` stride-1 innermost, zero transpose).
+* **Missingness:** Companion FST `@@` bitmaps with `fstd2nc` polarity (`keep where bitmap > 0, mask where bitmap == 0`), producing `NaN` in-memory (`DATASET_FILL_VALUE`) or `1e30` (`fst_mask_fill`) directly on write-out.
+* **Baselines (zero disk I/O; raw `float32` slabs & `@@` bitmaps resident in RAM, isolating pure orchestration + bitmap-apply + peel/rewrap + math):**
+  1. `open_fst(chunks="record")` — Dask `HighLevelGraph` (`tokenize` + `_lazy_record_chunk` per `(t, z)` record + `np.where(bmap > 0, slab, np.nan)`).
+  2. `open_fst(chunks="column")` — Dask `HighLevelGraph` (`_lazy_column_chunk` batching all `n_z` levels per `time` step).
+  3. `open_fst(chunks=False)` — Eager `np.where` bitmap apply + `.values` peel → NumPy kernel → `xr.DataArray` rewrap (`fst_*` attrs).
+
+#### Suite Results (`grtyp=U` Yin–Yang Supergrid `16 × 10 × 606 × 540` + 19,200-Record Open Tax)
+
+| Realistic Boreal Suite (All Verified `assert_allclose`) | `chunks='record'` HLG | `chunks='column'` HLG (16T) | `chunks=False` Eager Peel/Rewrap | `marray_xr` (Mojo 1.2 VM) | Speedup |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Bench 1:** `open_fst` Graph Assembly (80 leads × 40 lvls × 6 vars = 19,200 records, no I/O) | `32.76 ms` (16,080 tasks) | `1.62 ms` (400 tasks) | — | **`0.012 ms`** | **`2,760×` vs `record`** (`137×` vs `column`) |
+| **Bench 2:** `polaris` Thin 2D Peel (`isel(t=3,z=2)` + `WindModulus` → `(nj, ni)` C-buf for `aether`) | `7.024 ms` | `31.841 ms` *(reads all 10 lvls)* | — | **`0.858 ms`** | **`8.2×` vs `record`** (**`37.1×` vs `column`**) |
+| **Bench 3:** `boreal-postproc` Spooki `Humidex` (`exp`) + Direct `fst_mask_fill=1e30` Write Cube | — | `525.57 ms` | `635.69 ms` | **`60.43 ms`** | **`8.7×` vs `column` HLG** (**`10.5×` vs Eager**) |
+| **Bench 4:** `boreal-stat` `r.diag` (`ke` + Yin–Yang `areacell` Weighted `globavg` + `zonavg`) | — | `537.69 ms` | `549.57 ms` | **`84.88 ms`** | **`6.3×` vs `column` HLG** (`6.5×` vs Eager) |
+
+> [!TIP]
+> **Resolving the `column` vs. `record` Dilemma (`04-lazy-layouts.md`):** Today in `boreal-io`, `chunks="column"` keeps HLG construction manageable (`1.62 ms`) at the cost of `37×` slower 2D peels in `polaris` (`31.84 ms`, over-reading the whole vertical column), whereas `chunks="record"` speeds up 2D peels (`7.02 ms`) at the cost of `20×` larger HLG dictionaries (`32.76 ms` at 19k records, seconds/GBs at suite scale). `marray-mask`'s parametric catalog gives **both** a `12 µs` open **and** a `0.858 ms` single-record 2D peel from the exact same `Dataset`.
+
+#### Bench 5 — Tier-1 Operational `grtyp` Catalog Sweep (~99% of Operational Header Rows)
+Workload: 5-variable moist wind-thermal diagnostic (`hypot(UU, VV) * 0.514444 * HU + (TM_sfc - TT_4d)`) across `SynthGridSpec.large`:
+
+| `grtyp` (Catalog Share) | Geometry & Mask Hook | Cube Shape `(t, z, nj, ni)` | Combined Mask % | `record` HLG | `column` HLG (16T) | Eager Xarray | `marray_xr` | vs. `column` HLG |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`U`** (~53%) | Yin–Yang supergrid + panel seam | `(8, 10, 606, 540)` | `16.09%` | `297.89 ms` | `313.29 ms` | `393.31 ms` | **`20.43 ms`** | **`15.3×`** |
+| **`O`** (~23%) | Regional NW-Atlantic heavy coastal `@@` | `(8, 10, 480, 660)` | `61.78%` | `287.76 ms` | `304.45 ms` | `387.34 ms` | **`18.14 ms`** | **`16.8×`** |
+| **`Z`** (~15%) | Stretched tic-tac + rotated pole | `(8, 10, 303, 600)` | `28.12%` | `170.20 ms` | `150.35 ms` | `220.74 ms` | **`11.29 ms`** | **`13.3×`** |
+| **`G`** (~3%) | Gaussian latitudes | `(8, 10, 288, 576)` | `16.24%` | `171.73 ms` | `146.93 ms` | `195.38 ms` | **`10.65 ms`** | **`13.8×`** |
+| **`N`** (~3%) | Polar stereo + outside unit-disk mask | `(8, 10, 480, 480)` | `41.57%` | `202.70 ms` | `212.87 ms` | `308.57 ms` | **`16.64 ms`** | **`12.8×`** |
+| **`L`** (~2%) | Regular geographic lat-lon | `(8, 10, 303, 600)` | `15.44%` | `219.65 ms` | `166.72 ms` | `227.24 ms` | **`13.75 ms`** | **`12.1×`** |
+| **`M`** (<1%) | Unstructured mesh node list (`nj` thin) | `(8, 10, 4, 80000)` | `18.24%` | `237.51 ms` | `281.88 ms` | `354.67 ms` | **`23.63 ms`** | **`11.9×`** |
+
+Notice **`grtyp=O` (`61.78%` masked)** achieved the **highest speedup (`16.8×`)**: 64-element `ALL_ONES` word skipping in `morsel.mojo` skips continental land blocks completely during reductions, whereas NumPy/Xarray/Dask compute and scan every masked `NaN` cell.
+
 ---
 
 ## 3. System Architecture (4-Layer Stack)
@@ -204,13 +241,14 @@ When extending this codebase, keep these exact Mojo 1.2 behaviors in mind (also 
 
 ## 7. Strategic Opportunities (I/O, Duck Arrays, GPU)
 
-### 7.1 Plugging In Your Existing Zero-Copy Mojo Binary File Decoders
+### 7.1 Plugging In `boreal-io` (`cmc_io_fst_hdr` + `cmc_io_fst_data`) Directly
 > **See also:** [`docs/boreal/`](boreal/README.md) — how boreal-io / aether / postproc / stat use xarray, dask, and FST decode today (contracts for `RecordCatalog`, masks, and peel→kernel→rewrap).
 
-Your existing Mojo decoders already unpack compressed binary records in place. Connecting them directly to `vm.mojo` removes Python from the I/O loop completely:
-1. Build a lightweight **Binary Record Index (`RecordCatalog`)** mapping `(var_id, time_idx, level_idx) -> (file_idx, byte_offset, byte_len, encoding_tag)` (stored as a flat `mmap`-able struct array—even $50\text{ million}$ records is only $1.2\text{ GB}$ on disk / demand-paged in RAM!).
-2. Partition work by `(file_idx, record_idx)` across Mojo worker threads so each thread issues `pread` into a reusable compressed buffer, runs your Mojo decoder into a thread-local `SlabCache`, and streams `2,048`-element morsels through `eval_morsel_bytecode`.
-3. Add a **2–4 thread I/O prefetch ring buffer** (or `io_uring` on Linux via C FFI) so NVMe / Lustre / GPFS reads overlap 100% with SIMD decompression and compute—**still requiring zero Mojo language `async/await`**.
+`boreal-io` already cracks XDF/RSF headers (`cmc_io_fst_hdr`) and unpacks `datyp = 0, 1, 2, 4, 5, 130, 133, 134` in Mojo (`cmc_io_fst_data`: `unpack_many_f32_into`). Connecting them directly to `vm.mojo` removes Python from the I/O and bitmap-apply loop completely:
+1. Feed `cmc_io_fst_hdr` / `fst-classifier-mojo` header rows (`path, addr, lng, datyp, nbits, ni, nj, nk, mask_addr, mask_lng`) directly into a flat `MmapRecordCatalog` (`byte_offset ≈ (addr - 1) * 8`).
+2. Partition work across Mojo worker threads so each thread unpacks touched records + companion `@@` / `!@` bitmaps (`keep > 0, mask == 0`) into a reusable slab slot, immediately converting `@@` into `MSTATE_VALID | MSTATE_MASKED | MSTATE_BITS` (`MSRC_FST_BITMAP_U8` / `MSRC_FST_BITMAP_WORDS`) without a second `np.where` pass.
+3. Add **Multi-Sink Reduction Fusion** in `execute_bytecode_plan` so `boreal-stat` pipelines requesting multiple reductions on the same derived expression (e.g., `globavg` + `zonavg` on `ke` in Bench 4) evaluate `ke` once instead of twice—cutting Bench 4's `84.88 ms` in half to `~42 ms` (`>12×` vs. `column` HLG).
+4. Add a **2–4 thread I/O prefetch ring buffer** (or `io_uring` on Linux via C FFI) + zero-copy DLPack / MAX Buffer handoff into **aether**'s Mojo CSR `apply_weights` and **mojoviz** LUT painters—**requiring zero Mojo language `async/await`**.
 
 ### 7.2 Drop-In Xarray Integration via Python Array API (`__array_namespace__`)
 You do **not** have to rewrite Xarray's plotting, NetCDF/Zarr export, or `repr` HTML widgets to kill Dask!
@@ -288,8 +326,9 @@ pixi run interop
 # 4. Run the standalone pure-Mojo ECCC GDPS petabyte catalog & slab demo:
 pixi run demo
 
-# 5. Build `build/marray_mojo.so` and run the 4-workload Dask/Xarray/NumPy benchmark:
-pixi run bench-vs-dask
+# 5. Build `build/marray_mojo.so` and run both benchmark suites:
+pixi run bench-boreal    # Realistic Boreal/Aether suite (record/column HLG, peel-rewrap, U..M)
+pixi run bench-vs-dask   # General 4-way Mojo VM vs NumPy.ma vs Xarray vs Dask benchmark
 ```
 
 ### Included Agent Skills
