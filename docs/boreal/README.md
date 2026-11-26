@@ -23,6 +23,7 @@ FST unpack and many remapping / thermo / stat kernels are **already Mojo**. The 
 | [09-end-to-end-pipelines.md](09-end-to-end-pipelines.md) | polaris / mogc-api (path-free) |
 | [10-mojo-replacement-checklist.md](10-mojo-replacement-checklist.md) | Map to roadmap M1–M6 |
 | [11-non-goals.md](11-non-goals.md) | What stays Python; out of scope |
+| [12-synthetic-benchmark-data.md](12-synthetic-benchmark-data.md) | In-memory U/O/Z/L/G/N/M synth for benches |
 
 ## Stack map (high level)
 

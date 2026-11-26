@@ -63,3 +63,18 @@ from .numpy_bridge import (
     from_numpy_slab,
     to_numpy_masked,
 )
+from .synth import (
+    GRTYP_U,
+    GRTYP_O,
+    GRTYP_Z,
+    GRTYP_L,
+    GRTYP_G,
+    GRTYP_N,
+    GRTYP_M,
+    SynthGridSpec,
+    SynthAxes,
+    build_axes,
+    fill_and_decode_slab,
+    materialize_var_cube,
+    slab_mask_fraction,
+)

@@ -7,11 +7,25 @@ from marray import (
     MASK_BITMASK,
     Dataset,
     GDPSGridSpec,
+    GRTYP_U,
+    GRTYP_O,
+    GRTYP_Z,
+    GRTYP_L,
+    GRTYP_G,
+    GRTYP_N,
+    GRTYP_M,
+    VAR_TT,
+    VAR_TM,
     MaskedSlab,
+    RawLayerScratch,
+    SynthGridSpec,
+    build_axes,
     decode_float32_bitmap_into,
     decode_quant16_sentinel_into,
     decode_uint16_qflag_into,
+    fill_and_decode_slab,
     hypot,
+    slab_mask_fraction,
     slab_reduce_stats,
 )
 from marray.morsel import (
@@ -162,6 +176,64 @@ def test_morsel_single_pass_decode_and_optimizer_fusion() raises:
     assert_equal(len(plan.insts), 4)
     assert_equal(plan.insts[2].op, BC_HYPOT)
     assert_equal(plan.num_regs, 3)
+
+
+def test_synth_tier1_shapes_and_masks() raises:
+    var scratch = RawLayerScratch()
+    var dst = MaskedSlab()
+
+    var u = SynthGridSpec.tiny(GRTYP_U)
+    assert_equal(u.yin_ny, u.nj // 2)
+    var ua = build_axes(u)
+    assert_equal(ua.yin_ny, u.yin_ny)
+    assert_equal(len(ua.lon_f), u.ni * u.nj)
+    fill_and_decode_slab(
+        u, ua, VAR_TT, Float32(0.0), Float32(1000.0), 0, u.ni, 0, u.nj, scratch, dst
+    )
+    assert_equal(dst.ni, u.ni)
+    assert_equal(dst.nj, u.nj)
+
+    var n = SynthGridSpec.tiny(GRTYP_N)
+    var na = build_axes(n)
+    fill_and_decode_slab(
+        n, na, VAR_TT, Float32(0.0), Float32(500.0), 0, n.ni, 0, n.nj, scratch, dst
+    )
+    # Corners of the stereo square lie outside the unit disk -> some masking
+    assert_true(slab_mask_fraction(dst) > Float64(0.0))
+
+    var z = SynthGridSpec.tiny(GRTYP_Z)
+    var za = build_axes(z)
+    assert_equal(len(za.x_1d), z.ni)
+    assert_equal(len(za.y_1d), z.nj)
+
+    var g = SynthGridSpec.tiny(GRTYP_G)
+    var ga = build_axes(g)
+    assert_equal(len(ga.y_1d), g.nj)
+
+    var o = SynthGridSpec.tiny(GRTYP_O)
+    var oa = build_axes(o)
+    fill_and_decode_slab(
+        o, oa, VAR_TM, Float32(0.0), Float32(1015.0), 0, o.ni, 0, o.nj, scratch, dst
+    )
+    var ofrac = slab_mask_fraction(dst)
+    assert_true(ofrac > Float64(0.05))
+    assert_true(ofrac < Float64(0.95))
+
+    var m = SynthGridSpec.tiny(GRTYP_M)
+    assert_equal(m.nj, 1)
+    var ma = build_axes(m)
+    assert_equal(len(ma.lon_f), m.ni)
+    fill_and_decode_slab(
+        m, ma, VAR_TT, Float32(3.0), Float32(850.0), 0, m.ni, 0, m.nj, scratch, dst
+    )
+    assert_equal(dst.ni, m.ni)
+
+    var l = SynthGridSpec.tiny(GRTYP_L)
+    var la = build_axes(l)
+    fill_and_decode_slab(
+        l, la, VAR_TT, Float32(0.0), Float32(1000.0), 0, l.ni, 0, l.nj, scratch, dst
+    )
+    assert_equal(dst.size(), l.ni * l.nj)
 
 
 def test_dataset_sel_descending_levels() raises:
