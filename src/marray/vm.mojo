@@ -17,12 +17,14 @@ Upgraded with all Boreal / Aether production contracts (`docs/questions.md` Q1-Q
 from std.math import ceildiv, max, min, sqrt
 from std.memory import ImmPointer, MutPointer
 from std.runtime import parallelism_level
+from std.sys.info import size_of
 from max.algorithm import parallelize
 
 from .catalog import (
     CatalogSourceDesc,
     PlaneSlotCache,
     load_morsel_from_catalog,
+    load_morsel_from_predecoded_catalog,
 )
 from .morsel import (
     DTYPE_F32,
@@ -485,28 +487,41 @@ struct MorselWorkspace(Movable):
     var scratch: MorselReg
     var wt_reg: MorselReg
     var cat_slots: List[PlaneSlotCache]
+    var pre_slots_addr: Int
+    var pre_lookup_addr: Int
+    var pre_n_zt: Int
 
     def __init__(
         out self,
         num_regs: Int,
         cat_descs_ptr: ImmPointer[CatalogSourceDesc, _],
         n_cats: Int,
+        pre_slots_addr: Int = 0,
+        pre_lookup_addr: Int = 0,
+        pre_n_zt: Int = 0,
     ):
         self.regs = List[MorselReg](capacity=num_regs)
         for _ in range(num_regs):
             self.regs.append(MorselReg())
         self.scratch = MorselReg()
         self.wt_reg = MorselReg()
-        self.cat_slots = List[PlaneSlotCache](capacity=n_cats)
-        for c in range(n_cats):
+        var alloc_cats = 0 if pre_n_zt > 0 else n_cats
+        self.cat_slots = List[PlaneSlotCache](capacity=alloc_cats)
+        for c in range(alloc_cats):
             ref cd = cat_descs_ptr[unsafe_offset=c]
             self.cat_slots.append(PlaneSlotCache(cd.plane_ni * cd.plane_nj))
+        self.pre_slots_addr = pre_slots_addr
+        self.pre_lookup_addr = pre_lookup_addr
+        self.pre_n_zt = pre_n_zt
 
     def __init__(out self, *, deinit move: Self):
         self.regs = move.regs^
         self.scratch = move.scratch^
         self.wt_reg = move.wt_reg^
         self.cat_slots = move.cat_slots^
+        self.pre_slots_addr = move.pre_slots_addr
+        self.pre_lookup_addr = move.pre_lookup_addr
+        self.pre_n_zt = move.pre_n_zt
 
 
 @inline(.always)
@@ -527,8 +542,33 @@ def _load_morsel_from_source(
     coalesced_all: Bool,
     mut ws_cats: List[PlaneSlotCache],
     mut dst: MorselReg,
+    pre_slots_addr: Int = 0,
+    pre_lookup_addr: Int = 0,
+    pre_n_zt: Int = 0,
 ):
     if src.catalog_id >= 0:
+        if pre_n_zt > 0:
+            var ps_p = ImmPointer[PlaneSlotCache, ImmUntrackedOrigin](
+                unsafe_from_address=pre_slots_addr
+            )
+            var pl_p = ImmPointer[Int, ImmUntrackedOrigin](
+                unsafe_from_address=pre_lookup_addr
+                + src.catalog_id * pre_n_zt * size_of[Int]()
+            )
+            load_morsel_from_predecoded_catalog(
+                cat_descs_ptr[unsafe_offset=src.catalog_id],
+                ps_p,
+                pl_p,
+                d0_start,
+                d0_len,
+                d1_start,
+                d1_len,
+                d2_len,
+                flat_offset,
+                count,
+                dst,
+            )
+            return
         load_morsel_from_catalog(
             cat_descs_ptr[unsafe_offset=src.catalog_id],
             ws_cats[src.catalog_id],
@@ -792,6 +832,9 @@ def eval_morsel_bytecode(
                     coal_ptr[unsafe_offset=inst.src_id],
                     ws.cat_slots,
                     ws.regs[inst.dst_reg],
+                    ws.pre_slots_addr,
+                    ws.pre_lookup_addr,
+                    ws.pre_n_zt,
                 )
             case == BC_CONST:
                 ws.regs[inst.dst_reg].state = MSTATE_VALID
@@ -1533,8 +1576,68 @@ def execute_multi_sink_plan(
             par_safe = False
             break
 
+    # Shared Pre-Decode Pass for thin 2D peels / small-slab slices (`n_cats * n_zt <= 48`):
+    # Decodes each touched `(cat_id, rec_idx)` plane EXACTLY ONCE across workers instead of
+    # `n_workers` times, and unlocks 16-thread SIMD morsel compute even when `par_safe` is False!
+    var n_zt = d2_len * d3_len
+    var use_predecode = n_cats > 0 and n_zt > 0 and (n_cats * n_zt <= 48)
+    var pre_lookup = List[Int]()
+    var pre_slots = List[PlaneSlotCache]()
+    var pre_decoded_count = 0
+
+    if use_predecode:
+        pre_lookup.resize(n_cats * n_zt, 0)
+        var task_cats = List[Int]()
+        var task_recs = List[Int]()
+        for c_i in range(n_cats):
+            ref cd = cat_descs[c_i]
+            for t_rel in range(d3_len):
+                for z_rel in range(d2_len):
+                    var r_idx = (
+                        (d3_s + t_rel) * cd.rec_s_t + (d2_s + z_rel) * cd.rec_s_z
+                    )
+                    var found = -1
+                    for k in range(len(task_cats)):
+                        if task_cats[k] == c_i and task_recs[k] == r_idx:
+                            found = k
+                            break
+                    if found < 0:
+                        found = len(task_cats)
+                        task_cats.append(c_i)
+                        task_recs.append(r_idx)
+                        pre_slots.append(PlaneSlotCache(cd.plane_ni * cd.plane_nj))
+                    pre_lookup[c_i * n_zt + t_rel * d2_len + z_rel] = found
+
+        var n_tasks = len(task_cats)
+        if par_safe and n_tasks > 1:
+            var dec_nw = min(max(1, parallelism_level()), n_tasks)
+            var tc_p = ImmPointer[Int, origin_of(task_cats)](task_cats.unsafe_ptr())
+            var tr_p = ImmPointer[Int, origin_of(task_recs)](task_recs.unsafe_ptr())
+            var cd_p = ImmPointer[CatalogSourceDesc, origin_of(cat_descs)](
+                cat_descs.unsafe_ptr()
+            )
+            var ps_mut = pre_slots.unsafe_ptr()
+
+            def pre_dec_worker(wid: Int) {imm}:
+                var t0 = (wid * n_tasks) // dec_nw
+                var t1 = ((wid + 1) * n_tasks) // dec_nw
+                for ti in range(t0, t1):
+                    var ci = tc_p[unsafe_offset=ti]
+                    var ri = tr_p[unsafe_offset=ti]
+                    ps_mut[unsafe_offset=ti].ensure_decoded(
+                        cd_p[unsafe_offset=ci], ri
+                    )
+
+            parallelize(pre_dec_worker, dec_nw)
+        else:
+            for ti in range(n_tasks):
+                pre_slots[ti].ensure_decoded(cat_descs[task_cats[ti]], task_recs[ti])
+
+        for ti in range(n_tasks):
+            pre_decoded_count += pre_slots[ti].decode_calls
+
     var n_morsels = ceildiv(total_elems, MORSEL_LEN)
-    var hw = max(1, parallelism_level()) if par_safe else 1
+    var hw = max(1, parallelism_level()) if (par_safe or use_predecode) else 1
     var n_workers = min(hw, n_morsels)
 
     # Precompute per-sink axis-reduction geometry & packed workspace offsets
@@ -1628,16 +1731,29 @@ def execute_multi_sink_plan(
     var gmax_p = p_gmax.unsafe_ptr()
     var gval_p = p_gval.unsafe_ptr()
     var gtot_p = p_gtot.unsafe_ptr()
+    var p_decs = List[Int](capacity=n_workers)
+    p_decs.resize(n_workers, 0)
+    var pdecs_p = p_decs.unsafe_ptr()
 
     var n_insts = len(plan.insts)
     var num_regs = plan.num_regs
+    var pre_slots_addr = Int(pre_slots.unsafe_ptr()) if use_predecode else 0
+    var pre_lookup_addr = Int(pre_lookup.unsafe_ptr()) if use_predecode else 0
+    var active_pre_n_zt = n_zt if use_predecode else 0
 
     def ms_worker(wid: Int) {imm}:
         var m_begin = (wid * n_morsels) // n_workers
         var m_end = ((wid + 1) * n_morsels) // n_workers
         if m_begin >= m_end:
             return
-        var ws = MorselWorkspace(num_regs, cats_ptr, n_cats)
+        var ws = MorselWorkspace(
+            num_regs,
+            cats_ptr,
+            n_cats,
+            pre_slots_addr,
+            pre_lookup_addr,
+            active_pre_n_zt,
+        )
         var loc_accs = List[ReduceAcc](capacity=n_sinks)
         var loc_wx = List[Float64](capacity=n_sinks)
         var loc_ww = List[Float64](capacity=n_sinks)
@@ -1708,6 +1824,9 @@ def execute_multi_sink_plan(
                                 coal_ptr[unsafe_offset=wt_id],
                                 ws.cat_slots,
                                 ws.wt_reg,
+                                ws.pre_slots_addr,
+                                ws.pre_lookup_addr,
+                                ws.pre_n_zt,
                             )
                             last_loaded_wt = wt_id
                         morsel_accumulate_weighted(
@@ -1765,8 +1884,18 @@ def execute_multi_sink_plan(
                 gmax_p[unsafe_offset=g_idx] = loc_accs[s].max_val
                 gval_p[unsafe_offset=g_idx] = loc_accs[s].valid_count
                 gtot_p[unsafe_offset=g_idx] = loc_accs[s].total_count
+        var w_decs = 0
+        for c_i in range(len(ws.cat_slots)):
+            w_decs += ws.cat_slots[c_i].decode_calls
+        pdecs_p[unsafe_offset=wid] = w_decs
 
     parallelize(ms_worker, n_workers)
+    _ = pre_slots
+    _ = pre_lookup
+
+    var total_decoded_planes = pre_decoded_count
+    for w in range(n_workers):
+        total_decoded_planes += p_decs[w]
 
     # Finalize all `n_sinks` scalar stats & axis reduction outputs
     for s in range(n_sinks):
@@ -1774,7 +1903,8 @@ def execute_multi_sink_plan(
         var agg = Int(sink_agg_modes[unsafe_offset=s])
         var wt_id = Int(sink_wt_srcs[unsafe_offset=s])
         var fill_v = sink_fills[unsafe_offset=s]
-        var st_base = s * 8
+        var st_base = s * 9
+        out_sink_stats_f64[unsafe_offset=st_base + 8] = Float64(total_decoded_planes)
 
         if wt_id >= 0:
             var twx = 0.0

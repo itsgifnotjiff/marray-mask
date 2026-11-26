@@ -302,10 +302,12 @@ def test_catalog_datyp134_float32_bitmap_and_vertical_tiles() raises:
     )
 
     var meta: List[Int64] = [
+        Int64(-1),
         Int64(0),
         Int64(d_bytes),
         Int64(134),
         Int64(16),
+        Int64(-1),
         Int64(d_bytes),
         Int64(bm_bytes),
         Int64(2),

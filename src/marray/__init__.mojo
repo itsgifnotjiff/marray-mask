@@ -79,6 +79,9 @@ from .synth import (
     slab_mask_fraction,
 )
 from .catalog import (
+    CAT_FLAG_ADDR_MODE,
+    CAT_FLAG_FORCE_SERIAL,
+    CatalogFilePool,
     ChunkDecoderCABI,
     CatalogSourceDesc,
     PlaneSlotCache,

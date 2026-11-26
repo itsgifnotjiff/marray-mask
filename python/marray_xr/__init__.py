@@ -110,6 +110,12 @@ _UFUNC_MAP = {
 }
 
 _LIB_CACHE: ctypes.CDLL | None = None
+_LAST_DECODED_PLANES: int = 0
+
+
+def get_last_decoded_planes() -> int:
+    """Return exact number of `RecordCatalog` planes decoded during the most recent query."""
+    return _LAST_DECODED_PLANES
 
 
 def _resolve_so_path() -> Path:
@@ -169,6 +175,12 @@ def get_mojo_lib() -> ctypes.CDLL:
         i64_p,
     ]
     lib.marray_pack_fst_var.restype = ctypes.c_int64
+
+    lib.marray_file_pool_create.argtypes = [u8_p, i64_p, ctypes.c_int32]
+    lib.marray_file_pool_create.restype = ctypes.c_int64
+
+    lib.marray_file_pool_destroy.argtypes = [ctypes.c_int64]
+    lib.marray_file_pool_destroy.restype = ctypes.c_int32
 
     lib.marray_exec_general_plan.argtypes = [
         i64_p,
@@ -390,17 +402,19 @@ def synth_boreal_raw_arenas(
 
 @dataclass
 class CatalogVarSpec:
-    """Whole-record plane catalog binding (`Q1-Q4`: zero decoded cube in RAM)."""
+    """Whole-record plane catalog binding (`Q1-Q4` & `CONTEXT.md` P0: in-RAM or multi-file `pread`)."""
 
-    raw_owner: Any                # keeps `mmap` / `np.ndarray` byte buffer alive!
+    raw_owner: Any                # keeps `mmap` / `np.ndarray` / `FilePool` / `CFUNCTYPE` alive!
     raw_base_addr: int
-    rec_meta: np.ndarray          # contiguous `(n_records, 8)` int64 array
+    rec_meta: np.ndarray          # contiguous `(n_records, 10)` int64 array
     plane_ni: int
     plane_nj: int
     rec_s_z: int                  # `1` for 4D `(t, z, y, x)`, `0` for 3D `(t, y, x)` surface!
     rec_s_t: int                  # `n_z` for 4D, `1` for 3D surface, `0` for static 2D!
     decoder_fn_addr: int = 0
     decoder_ctx_addr: int = 0
+    file_pool_handle: int = 0     # `CatalogFilePool*` handle for multi-file POSIX `pread`
+    flags: int = 0                # `CAT_FLAG_FORCE_SERIAL (1)`, `CAT_FLAG_ADDR_MODE (2)`, `(prefix<<8)`
     logical_shape: tuple[int, ...] = ()
 
 
@@ -773,7 +787,7 @@ def _pack_sources_and_catalogs(
                 src_i64[i, 5 + d_idx] = 0
 
     nc = len(cat_specs)
-    cat_i64 = np.zeros((max(1, nc), 9), dtype=np.int64)
+    cat_i64 = np.zeros((max(1, nc), 11), dtype=np.int64)
     cat_f32 = np.zeros((max(1, nc), 2), dtype=np.float32)
     for c_i, cs in enumerate(cat_specs):
         cat_i64[c_i, 0] = cs.raw_base_addr
@@ -785,6 +799,8 @@ def _pack_sources_and_catalogs(
         cat_i64[c_i, 6] = cs.rec_s_t
         cat_i64[c_i, 7] = cs.decoder_fn_addr
         cat_i64[c_i, 8] = cs.decoder_ctx_addr
+        cat_i64[c_i, 9] = cs.file_pool_handle
+        cat_i64[c_i, 10] = cs.flags
         cat_f32[c_i, 0] = 1.0
         cat_f32[c_i, 1] = 0.0
 
@@ -936,7 +952,13 @@ class DataArray:
         return self._wrap(self._arena.emit(BC_FILLNA, self._node_id, p0=float(value)))
 
     def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any) -> Any:
-        if method != "__call__" or ufunc not in _UFUNC_MAP:
+        if method != "__call__":
+            return NotImplemented
+        if ufunc is np.square and len(inputs) == 1:
+            return self ** 2.0
+        if ufunc is np.power and len(inputs) == 2 and isinstance(inputs[0], DataArray) and not isinstance(inputs[1], DataArray):
+            return inputs[0] ** float(inputs[1])
+        if ufunc not in _UFUNC_MAP:
             return NotImplemented
         opcode = _UFUNC_MAP[ufunc]
         if len(inputs) == 1:
@@ -1344,7 +1366,7 @@ def compute_many(
             sink_addrs_i64[s_i] = arr.ctypes.data
             out_arrays.append((arr, od, osh))
 
-    out_stats = np.zeros((k_sinks, 8), dtype=np.float64)
+    out_stats = np.zeros((k_sinks, 9), dtype=np.float64)
     lib = get_mojo_lib()
     i64_p = ctypes.POINTER(ctypes.c_int64)
     i32_p = ctypes.POINTER(ctypes.c_int32)
@@ -1379,14 +1401,16 @@ def compute_many(
         out_stats.ctypes.data_as(f64_p),
     )
 
+    global _LAST_DECODED_PLANES
+    if n_cats > 0 and k_sinks > 0:
+        _LAST_DECODED_PLANES = int(out_stats[0, 8])
+
     results: list[Any] = []
     stat_slot = {AGG_MEAN: 0, AGG_STD: 1, AGG_MIN: 2, AGG_MAX: 3, AGG_SUM: 4, AGG_COUNT: 5}
     for s_i, sp in enumerate(specs):
         if sp.reduce_dims is None and sp.agg_mode >= 0:
             if _return_raw_stats:
-                pad = np.zeros(9, dtype=np.float64)
-                pad[:8] = out_stats[s_i]
-                results.append(pad)
+                results.append(out_stats[s_i].copy())
             else:
                 val = out_stats[s_i, stat_slot[sp.agg_mode]]
                 results.append(int(val) if sp.agg_mode == AGG_COUNT else float(val))
@@ -1468,7 +1492,7 @@ def to_aether_flat(
     sink_wts = np.full(n_fields, -1, dtype=np.int32)
     sink_fills = np.full(n_fields, float(masked_fill), dtype=np.float32)
     sink_addrs = np.array([flat[f].ctypes.data for f in range(n_fields)], dtype=np.int64)
-    out_stats = np.zeros((n_fields, 8), dtype=np.float64)
+    out_stats = np.zeros((n_fields, 9), dtype=np.float64)
 
     lib = get_mojo_lib()
     i64_p = ctypes.POINTER(ctypes.c_int64)
@@ -1665,6 +1689,8 @@ class Dataset:
         *,
         domain_dims: Sequence[str] | None = None,
         cell_measures: Mapping[str, Variable] | None = None,
+        extra_coords_2d: Mapping[str, tuple[tuple[str, str], np.ndarray]] | None = None,
+        close_fn: Callable[[], None] | None = None,
         attrs: Mapping[str, Any] | None = None,
         _arena: _ExprArena | None = None,
         _var_nodes: dict[str, int] | None = None,
@@ -1676,6 +1702,8 @@ class Dataset:
             k: (v if np.issubdtype(np.asarray(v).dtype, np.datetime64) else np.asarray(v, dtype=np.float64))
             for k, v in coords.items()
         }
+        self.extra_coords_2d = dict(extra_coords_2d or {})
+        self._close_fn = close_fn
         self.attrs = dict(attrs or {})
 
         if _arena is not None and _var_nodes is not None and _slices is not None:
@@ -1781,14 +1809,20 @@ def from_sources(sources: Sequence[Dataset], nomvar: str) -> DataArray:
 
 
 from .catalog import (  # noqa: E402
+    FilePool,
     PackedFSTArchive,
     open_fst_catalog,
     pack_boreal_fst_archive,
+    write_multifile_fst_leads,
 )
 from .duck import (  # noqa: E402
     MarrayDuckArray,
     open_fst_xarray,
     wrap_dataset_as_xarray,
+)
+from .fst_open import (  # noqa: E402
+    open_fst_paths_catalog,
+    open_fst_paths_xarray,
 )
 from .max_compiled import (  # noqa: E402
     CompiledMaxSession,
@@ -1796,6 +1830,12 @@ from .max_compiled import (  # noqa: E402
     has_gpu_accelerator,
     vorticity_stencil_cpu,
 )
+from .xarray_backend import (  # noqa: E402
+    MarrayFstBackendEntrypoint,
+    register_xarray_backend,
+)
+
+register_xarray_backend()
 
 __all__ = [
     "CatalogVarSpec",
@@ -1803,7 +1843,9 @@ __all__ = [
     "DataArray",
     "Dataset",
     "FST_MASK_FILL",
+    "FilePool",
     "MarrayDuckArray",
+    "MarrayFstBackendEntrypoint",
     "PackedFSTArchive",
     "SinkSpec",
     "Variable",
@@ -1811,11 +1853,15 @@ __all__ = [
     "compute_many",
     "from_sources",
     "get_builtin_decoder_addr",
+    "get_last_decoded_planes",
     "get_mojo_lib",
     "has_gpu_accelerator",
     "open_fst_catalog",
+    "open_fst_paths_catalog",
+    "open_fst_paths_xarray",
     "open_fst_xarray",
     "pack_boreal_fst_archive",
+    "register_xarray_backend",
     "rmse_f64",
     "stream_write_fst",
     "synth_boreal_raw_arenas",
@@ -1823,4 +1869,5 @@ __all__ = [
     "vertical_column_scan",
     "vorticity_stencil_cpu",
     "wrap_dataset_as_xarray",
+    "write_multifile_fst_leads",
 ]

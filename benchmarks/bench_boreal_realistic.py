@@ -558,7 +558,7 @@ def run_bench6_chunk_decoder_catalog(raw_u: dict[str, Any]) -> None:
         base_addr = archive.raw_bytes.ctypes.data
         for z in range(kz):
             r = t_idx * kz + z
-            d_off, d_len, dt, nb, bm_off, bm_len, bdt, bnb = (int(x) for x in meta[r])
+            _fid, d_off, d_len, dt, nb, _bfid, bm_off, bm_len, bdt, bnb = (int(x) for x in meta[r])
             lib.marray_builtin_fst_chunk_decoder(
                 0, ctypes.cast(base_addr + d_off, u8_p), d_len, dt, nb, ni, nj, 1, col[z].ctypes.data_as(f32_p)
             )

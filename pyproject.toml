@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marray-xr"
+version = "0.3.0"
+description = "Mojo 1.2 masked lazy array & zero-Dask Xarray FST backend (marray-mask)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "xarray>=2025.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[project.entry-points."xarray.backends"]
+marray_fst = "marray_xr.xarray_backend:MarrayFstBackendEntrypoint"
+
+[project.entry-points."xarray.chunkmanagers"]
+marray = "marray_xr.xarray_backend:MarrayChunkManager"

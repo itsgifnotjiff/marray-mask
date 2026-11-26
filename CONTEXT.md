@@ -123,3 +123,29 @@ pixi run bench-fst-real -- --smoke
 - Full M3 (boolean `where`), M5 (stencils), M6 (multi-node / GPU)
 - Committing operational suite paths or FST binaries
 - Changing published synthetic B1–B8 numbers
+
+---
+
+## 9. P0 Implementation Status (Ready for Work-Machine Real-FST Smoke)
+
+All 5 P0 items + Wishlist #28 KPI are now wired and verified locally (`pixi run test` + `pixi run test-p0`):
+
+1. **Multi-file OS I/O pool (`src/marray/catalog.mojo`, `python/marray_xr/catalog.py`):**
+   - `CatalogFilePool` (`marray_file_pool_create` / `marray_file_pool_destroy`) manages read-only POSIX file descriptors across multi-lead files using thread-safe `pread` (`_pread_exact`), keeping Python `np.memmap` LRU off the hot path.
+   - `REC_META_STRIDE = 10` (`[file_id, d_off, d_len, datyp, nbits, bmap_file_id, bm_off, bm_len, b_dt, b_nb]`) supports multi-file records, `@@` companion bitmaps, ragged `pad` missing slots (`d_len <= 0`), and RPN alt-masks (`64 <= datyp < 128`, max-value marks missing).
+   - Shared single-plane pre-decode (`load_morsel_from_predecoded_catalog` in `catalog.mojo` / `vm.mojo`) ensures thin 2D peels (`n_cats * n_zt <= 48`) decode each touched `(var, rec_idx)` plane **once** across all 16 worker threads (`mxr.get_last_decoded_planes() == 2` on `hypot(u2d, v2d)`).
+2. **Live `open_fst_xarray(paths)` (`python/marray_xr/fst_open.py`):**
+   - Accepts operational `.std` / `.fst` lead paths (via `MARRAY_CMC_IO` / `cmc_root`) or standalone `.mfst` multi-lead files.
+   - Extracts per-record header metadata (`path, addr, lng, datyp, nbits, mask_addr, mask_lng`) without computing any Dask graph or re-packing payloads, splits compatible groups (`vctype`), preserves CF spatial dims (`rlat`/`rlon`, `lat`/`lon`, or `y`/`x`), 2D geographic `lat`/`lon`, `areacell`, `datetime64[ns]` `time`, OpenData names, and `fst_*` attrs.
+   - **Decoder resolution:** Uses **Tier A** (`MARRAY_CMC_CABI_SO` built from [`bridges/cmc_io_cabi_shim.mojo`](bridges/cmc_io_cabi_shim.mojo) against `$MARRAY_CMC_IO` for 16-thread zero-GIL POSIX `pread` + `cmc_io_fst.unpack_batch`) when present, and automatically falls back out-of-the-box to **Tier B** (`ctypes` `CFUNCTYPE` bridge calling `boreal.io.xarray.decode` single-record unpackers on demand into `PlaneSlotCache`, followed by 16-thread SIMD morsel compute).
+3. **Xarray `BackendEntrypoint` & `ChunkManagerEntrypoint` (`python/marray_xr/xarray_backend.py`, `pyproject.toml`):**
+   - Registers `engine="marray_fst"` (`MarrayFstBackendEntrypoint`) and `chunked_array_type="marray"` (`MarrayChunkManager`) both in `pyproject.toml` and dynamically on `import marray_xr` (works under `PYTHONPATH` on PBS nodes without `pip install`).
+   - Hooks `da.compute()`, `ds.compute()` (single-pass multi-sink `compute_many`!), and zero-decode `repr(ds)` with **zero Dask dependency**.
+4. **Work-machine R-P0 KPI verification (`benchmarks/bench_fst_real.py`):**
+   ```bash
+   export MARRAY_CMC_IO=...
+   export MARRAY_FST_PRES_ROOT=...
+   pixi run test-p0
+   pixi run bench-fst-real -- --smoke --mode lazy-open
+   pixi run bench-fst-real -- --leads 4 --mode both
+   ```

@@ -15,6 +15,7 @@ dask = "*"
 
 [tasks]
 test = "mojo run -O3 -I src tests/test_marray_mask.mojo"
+test-p0 = { cmd = "python -u tests/test_p0_multifile_xarray_load.py", depends-on = ["build-ext"] }
 interop = "mojo run -O3 -I src src/interop_demo.mojo"
 demo = "mojo run -O3 -I src src/gdps_prototype.mojo"
 synth-bench = "mojo run -O3 -I src src/synth_bench_demo.mojo"

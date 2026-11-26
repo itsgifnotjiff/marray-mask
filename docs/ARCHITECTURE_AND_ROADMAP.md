@@ -287,11 +287,12 @@ You do **not** have to rewrite Xarray's plotting, NetCDF/Zarr export, or `repr` 
 
 Boreal-facing milestone checklist and phased UX (duck array → pure Mojo Dataset): [`docs/boreal/10-mojo-replacement-checklist.md`](boreal/10-mojo-replacement-checklist.md).
 
-### Milestone M1 — Pluggable Out-of-Core Binary File Catalog & Decoder Trait *(Core Engine Implemented)*
-* **Implemented in v0.3 (`src/marray/catalog.mojo`, `python/marray_xr/catalog.py`):**
-  * Separate-`.so` `ChunkDecoderCABI` function-pointer interface + `is_datyp_parallel_safe` (`datyp=6` serial safety guard).
-  * Per-worker `PlaneSlotCache` whole-record plane decoder (`datyp=134` + `datyp=2` `float32` `0/1` `@@` bitmaps), regional `[j0:j1, i0:i1]` single-decode slicing, cross-`vctype` `list[Dataset]` joins (`from_sources`), and chunked `stream_write_fst` (`fst_mask_fill=1e30`).
-* **Next Step (On Work Machine with `boreal-io`):** Wire `cmc_io_fst_hdr` header arrays + `cmc_io_fst` raw unpacker symbol address + OS `pread`/`mmap` file-descriptor pool directly into `CatalogVarSpec`, and optionally add a packed-`UInt64` 1-bit `@@` unpack entry in `boreal-io` (`32×` less bitmap traffic than `float32` `0/1` planes).
+### Milestone M1 — Pluggable Out-of-Core Binary File Catalog & Decoder Trait *(Implemented)*
+* **Implemented in v0.3 (`src/marray/catalog.mojo`, `python/marray_xr/catalog.py`, `python/marray_xr/fst_open.py`, `bridges/cmc_io_cabi_shim.mojo`):**
+  * Separate-`.so` `ChunkDecoderCABI` function-pointer interface + `is_datyp_parallel_safe` (`datyp=6` serial safety guard) + RPN alt-mask (`datyp + 64`) support.
+  * Multi-file OS file-descriptor pool (`CatalogFilePool` via POSIX `open`/`pread`/`close`) + shared single-plane pre-decode (`load_morsel_from_predecoded_catalog`, decoding each touched `(var, rec_idx)` plane once across 16 workers on thin 2D peels) + per-worker `PlaneSlotCache` for full-cube scans.
+  * Live `open_fst_xarray(paths)` / `open_fst_paths_catalog(paths)` mapping `boreal-io` header rows without re-encoding payloads (Tier A `bridges/cmc_io_cabi_shim.mojo` C-ABI `.so` + Tier B zero-build `boreal.io.xarray.decode` single-record bridge).
+* **Optional Future Optimization:** Add a packed-`UInt64` 1-bit `@@` unpack entry in `boreal-io` (`32×` less bitmap traffic than `float32` `0/1` planes).
 
 ### Milestone M2 — Rank-Generic Coordinate Odometer & Output-Tiled Axis Reductions *(Partially Implemented)*
 * **Implemented in v0.3 (`src/marray/vm.mojo`):**
@@ -303,10 +304,11 @@ Boreal-facing milestone checklist and phased UX (duck array → pure Mojo Datase
   * Add `BC_CMP_{EQ,NE,LT,LE,GT,GE}` producing bitmask registers, `BC_MASK_{AND,OR,XOR,NOT}`, and 3-operand `BC_WHERE(cond, true_val, false_val)`.
   * Support `DataArray` boolean operators (`&`, `|`, `~`) and cross-variable `xr.where(cond, x, y)`.
 
-### Milestone M4 — Xarray `BackendEntrypoint` & `__array_namespace__` Duck Array *(Phase A Implemented)*
-* **Implemented in v0.3 (`python/marray_xr/duck.py`):**
-  * `MarrayDuckArray` (`__array_ufunc__`, `__array_function__`, `__getitem__`, `__array__`) + `open_fst_xarray` returning genuine `list[xr.Dataset]` objects without Dask.
-* **Next Step:** Register `[project.entry-points."xarray.backends"]` (`xr.open_dataset(..., engine="marray_fst")`) and complete full Python Array API (`__array_namespace__`) coverage (`concat`, `broadcast_arrays`, `where`).
+### Milestone M4 — Xarray `BackendEntrypoint`, `ChunkManagerEntrypoint` & Duck Array *(Phase A & B Implemented)*
+* **Implemented in v0.3 (`python/marray_xr/duck.py`, `python/marray_xr/xarray_backend.py`, `pyproject.toml`):**
+  * `MarrayDuckArray` (`__array_ufunc__` incl. `np.power`/`np.square`, `__array_function__`, `__getitem__`, `__array__`) + `open_fst_xarray(paths_or_archive)` returning genuine `list[xr.Dataset]` objects without Dask.
+  * `MarrayFstBackendEntrypoint` (`xr.open_dataset(..., engine="marray_fst")`) and `MarrayChunkManager` (`ChunkManagerEntrypoint` hooking `da.compute()`, single-pass multi-var `ds.compute()`, and zero-decode `repr(ds)`) registered both in `pyproject.toml` and dynamically under `PYTHONPATH`.
+* **Remaining:** Complete full Python Array API (`__array_namespace__`) coverage (`concat`, `broadcast_arrays`, ternary `where`).
 
 ### Milestone M5 — Spatial Stencils, Halo Exchange & Coordinate Alignment
 * **Deliverables:**

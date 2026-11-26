@@ -47,29 +47,34 @@ cd marray-mask
 
 pixi install
 pixi run test            # 6 Mojo std.testing.TestSuite unit tests (incl. catalog & vertical tiles)
+pixi run test-p0         # P0 multi-file POSIX pread + open_fst_xarray(paths) + engine="marray_fst"
 pixi run synth-bench     # Standalone Mojo Tier-1 grtyp (U/O/Z/L/G/N/M) fill+decode demo
 pixi run bench-boreal    # Realistic Boreal/Aether B1-B8 suite (M1 catalog, M4 duck array, aether, stat)
 pixi run bench-max       # Proof suite: TileTensor (col_major/row_major), VM vs AOT, & GPU/MAX session
 pixi run bench-vs-dask   # General 4-way Mojo VM vs NumPy.ma vs Xarray vs Dask benchmark
 # Real GDPS FST (set MARRAY_CMC_IO + MARRAY_FST_PRES_ROOT; no paths in-tree):
 # export MARRAY_CMC_IO=... MARRAY_FST_PRES_ROOT=...
+pixi run bench-fst-real -- --smoke --mode lazy-open
 pixi run bench-fst-real -- --smoke
 ```
 
-## Example Usage: M1 `RecordCatalog`, M4 `xr.Dataset` Duck Array & `aether` Handoff
+## Example Usage: Multi-File `open_fst_xarray(paths)`, `engine="marray_fst"` & `aether` Handoff
 
 ```python
 import numpy as np
+import xarray as xr
 import marray_xr as mxr
 
-# 1. Open packed FST archive into `list[mxr.Dataset]` split by `vctype` (hybrid + surface)
-ds_list = mxr.open_fst_catalog(archive)  # zero payload unpack at open time!
+# 1. P0 Multi-file lazy FST -> `list[xr.Dataset]` (O(headers) open, POSIX `pread`, zero Dask!):
+dss = mxr.open_fst_xarray(lead_paths)  # or xr.open_dataset(path, engine="marray_fst", chunks={}, chunked_array_type="marray")
+u2d = dss[0]["WindU"].isel(time=2).sel(vertical=500.0, method="nearest")
+v2d = dss[0]["WindV"].isel(time=2).sel(vertical=500.0, method="nearest")
+uv_2d = (np.hypot(u2d, v2d) * np.float32(0.514444)).compute()  # decodes ONLY 2 planes via pread!
+
+# 2. M1 `RecordCatalog` cross-`vctype` (`hybrid` + `surface`) join:
+ds_list = mxr.open_fst_catalog(archive)
 tt = mxr.from_sources(ds_list, "TT")
 tm = mxr.from_sources(ds_list, "TM")     # 3D surface auto-broadcasts against 4D hybrid!
-
-# 2. M4 Drop-in `xarray.Dataset` (`MarrayDuckArray`) for unmodified downstream plugins:
-xr_datasets = mxr.open_fst_xarray(archive)
-uv_2d = np.hypot(xr_datasets[0]["WindU"].isel(time=3), xr_datasets[0]["WindV"].isel(time=3))
 
 # 3. Single-pass multi-sink fusion (`globavg` + `zonavg` in ONE scan) & `aether` finite flat buffer:
 ke = 0.5 * ((ds_list[0].find_by_nomvar("UU") * 0.514444) ** 2 + (ds_list[0].find_by_nomvar("VV") * 0.514444) ** 2)

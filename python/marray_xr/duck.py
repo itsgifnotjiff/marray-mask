@@ -1,16 +1,16 @@
-"""M4 Phase A Xarray Duck-Array Backend (`docs/questions.md` Q13, `10-mojo-migration-targets.md`).
+"""M4 Phase A Xarray Duck-Array Backend (`CONTEXT.md` P0 & `docs/questions.md` Q13).
 
 Wraps lazy `mxr.DataArray` nodes inside genuine `xarray.Dataset` / `xarray.DataArray`
 objects via `MarrayDuckArray` (`__array_ufunc__`, `__array_function__`, `__getitem__`,
-`__array__`). Existing `boreal-postproc`, `boreal-stat`, `polaris`, and `aether`
-plugins can slice (`.isel()`, `.sel(method='nearest')`), compose NumPy ufuncs
-(`np.hypot`, `np.exp`, arithmetic), reduce (`.mean(dim=...)`), or peel (`.values` /
-`np.asarray(...)`) WITHOUT constructing a Dask `HighLevelGraph`!
+`__array__`). Preserves Boreal CF horizontal dimension names (`rlat`/`rlon`, `lat`/`lon`,
+or `y`/`x`), 2D geographic `lat`/`lon` coordinates, `areacell`, `datetime64[ns]` `time`,
+and `fst_*` metadata with ZERO Dask imports!
 """
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Sequence
 
 import numpy as np
 import xarray as xr
@@ -51,11 +51,18 @@ class MarrayDuckArray:
             sz *= n
         return sz
 
+    @property
+    def chunks(self) -> tuple[tuple[int, ...], ...]:
+        """Record-plane chunk topology (`(1, ..., 1, nj, ni)`) for Xarray repr & ChunkManager."""
+        sh = self.shape
+        nd = len(sh)
+        return tuple((1,) * n if i < nd - 2 else (n,) for i, n in enumerate(sh))
+
     def _squeezed_dims(self) -> tuple[str, ...]:
         act = set(self._active_dims)
         return tuple(d for d in self._inner.dims if d not in act)
 
-    def compute(self, *, fill_value: float = np.nan) -> np.ndarray:
+    def compute(self, *, fill_value: float = np.nan, **kwargs: Any) -> np.ndarray:
         xr_da = self._inner.compute(
             fill_value=fill_value, squeeze=self._squeezed_dims()
         )
@@ -68,12 +75,10 @@ class MarrayDuckArray:
         return arr
 
     def __getitem__(self, key: Any) -> "MarrayDuckArray":
-        # Xarray passes `ExplicitlyIndexed` wrappers (`BasicIndexer((slice, int, ...))`)!
         raw_key = getattr(key, "tuple", key)
         if not isinstance(raw_key, tuple):
             raw_key = (raw_key,)
 
-        # Expand `Ellipsis` if present
         if Ellipsis in raw_key:
             e_pos = raw_key.index(Ellipsis)
             n_fill = self.ndim - (len(raw_key) - 1)
@@ -94,7 +99,6 @@ class MarrayDuckArray:
                     isel_kw[d_name] = item
                 new_active.append(d_name)
             else:
-                # Fallback for arbitrary 1D fancy indexers
                 arr = self.compute()
                 return arr[raw_key]  # type: ignore[return-value]
 
@@ -146,7 +150,6 @@ class MarrayDuckArray:
                 active = x._active_dims
         res = self._inner.__array_ufunc__(ufunc, method, *unwrapped, **kwargs)
         if res is NotImplemented:
-            # Graceful fallback to materialized NumPy ufunc for esoteric ufuncs
             np_in = [np.asarray(x) if isinstance(x, MarrayDuckArray) else x for x in inputs]
             return getattr(ufunc, method)(*np_in, **kwargs)
         return MarrayDuckArray(res, active)
@@ -181,11 +184,12 @@ class MarrayDuckArray:
 
 
 def wrap_dataset_as_xarray(ds: mxr.Dataset) -> xr.Dataset:
-    """Wrap an `mxr.Dataset` into a standard `xarray.Dataset` backed by `MarrayDuckArray`."""
+    """Wrap an `mxr.Dataset` into a standard `xarray.Dataset` backed by `MarrayDuckArray`,
+    preserving `rlat`/`rlon` or `y`/`x` spatial dims, 2D `lat`/`lon`, and `areacell`!
+    """
     data_vars: dict[str, tuple[tuple[str, ...], MarrayDuckArray, dict[str, Any]]] = {}
     for vname in ds._var_nodes:
         mda = ds[vname]
-        # Respect variable's native rank (e.g. 3D surface `(time, y, x)` inside 4D dataset!)
         src_var = None
         op, a, *_ = ds._arena.nodes[mda._node_id]
         if op == mxr.BC_LOAD:
@@ -194,22 +198,49 @@ def wrap_dataset_as_xarray(ds: mxr.Dataset) -> xr.Dataset:
         data_vars[vname] = (v_dims, MarrayDuckArray(mda, v_dims), dict(mda.attrs))
 
     coords: dict[str, Any] = {k: v for k, v in ds.coords.items()}
+    for cname, (cdims, carr) in getattr(ds, "extra_coords_2d", {}).items():
+        coords[cname] = (cdims, carr)
     if "areacell" in ds.cell_measures:
-        coords["areacell"] = (("y", "x"), ds.cell_measures["areacell"].data)
+        ac_var = ds.cell_measures["areacell"]
+        ac_dims = ac_var.dims if len(ac_var.dims) == 2 else ds._arena.domain_dims[-2:]
+        coords["areacell"] = (ac_dims, ac_var.data)
 
-    return xr.Dataset(data_vars, coords=coords, attrs=dict(ds.attrs))
+    xr_ds = xr.Dataset(data_vars, coords=coords, attrs=dict(ds.attrs))
+    if getattr(ds, "_close_fn", None) is not None:
+        xr_ds.set_close(ds._close_fn)
+    return xr_ds
 
 
 def open_fst_xarray(
-    archive: mxr.PackedFSTArchive,
+    source: mxr.PackedFSTArchive | str | Path | Sequence[str | Path],
     *,
+    vars: Sequence[str] | None = None,
     decoder_fn_addr: int | None = None,
     split_vctype: bool = True,
+    open_data_mapping: bool = True,
+    cell_measures: bool = True,
+    cmc_root: str | Path | None = None,
 ) -> list[xr.Dataset]:
-    """M4 Phase A `open_fst` replacement returning genuine `list[xr.Dataset]` objects
-    backed by `MarrayDuckArray` + M1 `RecordCatalog` (`ChunkDecoder` whole-plane decode)!
+    """M4 Phase A `open_fst` replacement (`CONTEXT.md` P0):
+      - Accepts EITHER on-disk FST / `.mfst` file path(s) (`open_fst_xarray(paths)`)
+        OR an in-memory `PackedFSTArchive`.
+      - Returns `list[xr.Dataset]` backed by `MarrayDuckArray` + `RecordCatalog`
+        with `O(headers)` open time, surgical per-plane decode on `.isel()`/`.sel()`,
+        CF coords (`rlat`/`rlon`, 2D `lat`/`lon`, `areacell`, `datetime64` `time`),
+        and ZERO Dask `HighLevelGraph` construction!
     """
-    cats = mxr.open_fst_catalog(
-        archive, decoder_fn_addr=decoder_fn_addr, split_vctype=split_vctype
+    if isinstance(source, mxr.PackedFSTArchive):
+        cats = mxr.open_fst_catalog(
+            source, decoder_fn_addr=decoder_fn_addr, split_vctype=split_vctype
+        )
+        return [wrap_dataset_as_xarray(c) for c in cats]
+
+    return mxr.open_fst_paths_xarray(
+        source,
+        vars=vars,
+        decoder_fn_addr=decoder_fn_addr,
+        split_vctype=split_vctype,
+        open_data_mapping=open_data_mapping,
+        cell_measures=cell_measures,
+        cmc_root=cmc_root,
     )
-    return [wrap_dataset_as_xarray(c) for c in cats]

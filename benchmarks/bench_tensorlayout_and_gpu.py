@@ -265,7 +265,7 @@ def run_proof3_cape_and_aether_pipeline(
 
     def _slice_rec_bytes(nomvar: str) -> tuple[np.ndarray, np.ndarray]:
         row = archive.var_tables[nomvar][rec_idx]
-        d_off, d_len, _, _, bm_off, bm_len, _, _ = (int(x) for x in row)
+        _fid, d_off, d_len, _, _, _bfid, bm_off, bm_len, _, _ = (int(x) for x in row)
         return archive.raw_bytes[d_off : d_off + d_len], archive.raw_bytes[bm_off : bm_off + bm_len]
 
     ru_b, rbm_b = _slice_rec_bytes("UU")

@@ -209,6 +209,96 @@ def run_rb6_catalog(raw: dict[str, Any], *, repeats: int) -> None:
     print(f"  regional   : {tr:8.2f} ms  window y=[{y0}:{y1}] x=[{x0}:{x1}] z=[:{z1}]")
 
 
+def run_rp0_lazy_open_and_first_peel(
+    leads: list[Path],
+    *,
+    max_levels: int | None,
+    cmc_root: Path,
+    repeats: int,
+) -> None:
+    """Wishlist item 28 (`CONTEXT.md` §6 KPI): compare **lazy open + first thin `.isel`
+    compute** (`open_ms + first_peel_ms`) vs boreal `chunks='record' | 'column' | False`!
+    """
+    _print_header(
+        "R-P0 KPI: LAZY OPEN + FIRST THIN `.isel` COMPUTE (`open_fst_xarray` vs boreal `open_fst`)"
+    )
+    fstload.ensure_boreal_on_path(cmc_root)
+    from boreal.io import open_fst  # type: ignore[import-not-found]
+
+    paths = [str(p) for p in leads]
+    nomvars = ["TT", "UU", "VV", "HU"]
+
+    def _pick_primary(dss: list[xr.Dataset]) -> xr.Dataset:
+        def _vrank(d: xr.Dataset) -> int:
+            try:
+                v = _xr_find_nomvar(d, "TT")
+                return int(v.sizes.get("vertical", 1))
+            except KeyError:
+                return -1
+        return max(dss, key=_vrank)
+
+    def _measure_mode(open_fn, is_dask: bool) -> tuple[float, float, np.ndarray]:
+        open_samples = []
+        peel_samples = []
+        last_arr = np.empty((1, 1), dtype=np.float32)
+        for r_i in range(max(1, repeats)):
+            t0 = time.perf_counter()
+            dss = open_fn()
+            t_open = (time.perf_counter() - t0) * 1000.0
+
+            prim = _pick_primary(dss)
+            v_coord = np.asarray(prim.coords["vertical"].values)
+            target = float(v_coord[min(3, len(v_coord) - 1)])
+
+            t1 = time.perf_counter()
+            u = _xr_find_nomvar(prim, "UU").isel(time=0).sel(vertical=target, method="nearest")
+            v = _xr_find_nomvar(prim, "VV").isel(time=0).sel(vertical=target, method="nearest")
+            uv = np.hypot(u, v) * np.float32(0.514444)
+            if is_dask:
+                last_arr = np.asarray(uv.compute(scheduler="threads", num_workers=8).values)
+            else:
+                last_arr = np.asarray(uv.compute().values if hasattr(uv, "compute") else uv.values)
+            t_peel = (time.perf_counter() - t1) * 1000.0
+
+            for ds_i in dss:
+                ds_i.close()
+            if r_i > 0 or repeats == 1:
+                open_samples.append(t_open)
+                peel_samples.append(t_peel)
+        return statistics.median(open_samples), statistics.median(peel_samples), last_arr
+
+    o_eag, p_eag, ref_uv = _measure_mode(
+        lambda: open_fst(paths, vars=nomvars, chunks=False, engine="mojo", open_data_mapping=True, cell_measures=True, apply_masks=True),
+        is_dask=False,
+    )
+    o_col, p_col, _ = _measure_mode(
+        lambda: open_fst(paths, vars=nomvars, chunks="column", engine="mojo", open_data_mapping=True, cell_measures=True, apply_masks=True),
+        is_dask=True,
+    )
+    o_rec, p_rec, _ = _measure_mode(
+        lambda: open_fst(paths, vars=nomvars, chunks="record", engine="mojo", open_data_mapping=True, cell_measures=True, apply_masks=True),
+        is_dask=True,
+    )
+    o_mxr, p_mxr, got_uv = _measure_mode(
+        lambda: mxr.open_fst_xarray(leads, vars=nomvars, open_data_mapping=True, cell_measures=True, cmc_root=cmc_root),
+        is_dask=False,
+    )
+    decs = mxr.get_last_decoded_planes()
+    np.testing.assert_allclose(got_uv, ref_uv, rtol=1e-4, atol=1e-3, equal_nan=True)
+
+    print(f"  {'Mode':<34} {'Open (ms)':>11} {'1st Peel (ms)':>14} {'Cold Total':>12} {'vs Eager':>10}")
+    print("  " + "-" * 85)
+    for label, om, pm in [
+        ("boreal open_fst(chunks=False)", o_eag, p_eag),
+        ("boreal open_fst(chunks='column')", o_col, p_col),
+        ("boreal open_fst(chunks='record')", o_rec, p_rec),
+        (f"marray open_fst_xarray ({decs} planes)", o_mxr, p_mxr),
+    ]:
+        tot = om + pm
+        eag_tot = o_eag + p_eag
+        print(f"  {label:<34} {om:10.2f}ms {pm:13.2f}ms {tot:10.2f}ms {eag_tot / max(1e-6, tot):9.1f}x")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", type=Path, default=None, help="GDPS prog/pres directory")
@@ -217,9 +307,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-levels", type=int, default=None, help="cap vertical levels after decode")
     p.add_argument(
         "--mode",
-        choices=("arenas", "catalog", "both"),
+        choices=("lazy-open", "arenas", "catalog", "both"),
         default="both",
-        help="arenas=R-B2/R-B4, catalog=R-B6, both=all",
+        help="lazy-open=R-P0 KPI, arenas=R-B2/R-B4, catalog=R-B6, both=all",
     )
     p.add_argument("--smoke", action="store_true", help="1 lead, few levels, fewer repeats")
     p.add_argument("--repeats", type=int, default=5)
@@ -250,6 +340,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  leads      : {[p.name for p in leads]}")
     if max_levels:
         print(f"  max_levels : {max_levels}")
+
+    if args.mode in ("lazy-open", "both"):
+        run_rp0_lazy_open_and_first_peel(
+            leads, max_levels=max_levels, cmc_root=cmc, repeats=max(2, repeats)
+        )
+        if args.mode == "lazy-open":
+            return 0
 
     raw, timing = fstload.load_raw_arenas(
         leads, max_levels=max_levels, cmc_root=cmc

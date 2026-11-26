@@ -33,6 +33,7 @@ from marray.tensor_layout_ops import (
 )
 
 from marray.catalog import (
+    CatalogFilePool,
     CatalogSourceDesc,
     REC_META_STRIDE,
     builtin_fst_chunk_decode,
@@ -131,10 +132,11 @@ def marray_pack_fst_var(
                     dst_f[unsafe_offset=k] = p_src[unsafe_offset=k]
 
             var m_base = r * REC_META_STRIDE
-            out_rec_meta_i64[unsafe_offset=m_base + 0] = Int64(rec_off)
-            out_rec_meta_i64[unsafe_offset=m_base + 1] = Int64(data_rec_bytes)
-            out_rec_meta_i64[unsafe_offset=m_base + 2] = Int64(datyp)
-            out_rec_meta_i64[unsafe_offset=m_base + 3] = Int64(
+            out_rec_meta_i64[unsafe_offset=m_base + 0] = Int64(-1)  # in-RAM archive
+            out_rec_meta_i64[unsafe_offset=m_base + 1] = Int64(rec_off)
+            out_rec_meta_i64[unsafe_offset=m_base + 2] = Int64(data_rec_bytes)
+            out_rec_meta_i64[unsafe_offset=m_base + 3] = Int64(datyp)
+            out_rec_meta_i64[unsafe_offset=m_base + 4] = Int64(
                 16 if Int(datyp) == 134 else 32
             )
 
@@ -145,18 +147,43 @@ def marray_pack_fst_var(
                     nelm,
                     dst_archive_bytes.unsafe_offset(bm_off),
                 )
-                out_rec_meta_i64[unsafe_offset=m_base + 4] = Int64(bm_off)
-                out_rec_meta_i64[unsafe_offset=m_base + 5] = Int64(bmap_rec_bytes)
-                out_rec_meta_i64[unsafe_offset=m_base + 6] = Int64(2)
-                out_rec_meta_i64[unsafe_offset=m_base + 7] = Int64(1)
+                out_rec_meta_i64[unsafe_offset=m_base + 5] = Int64(-1)
+                out_rec_meta_i64[unsafe_offset=m_base + 6] = Int64(bm_off)
+                out_rec_meta_i64[unsafe_offset=m_base + 7] = Int64(bmap_rec_bytes)
+                out_rec_meta_i64[unsafe_offset=m_base + 8] = Int64(2)
+                out_rec_meta_i64[unsafe_offset=m_base + 9] = Int64(1)
             else:
-                out_rec_meta_i64[unsafe_offset=m_base + 4] = Int64(-1)
-                out_rec_meta_i64[unsafe_offset=m_base + 5] = Int64(0)
-                out_rec_meta_i64[unsafe_offset=m_base + 6] = Int64(0)
+                out_rec_meta_i64[unsafe_offset=m_base + 5] = Int64(-1)
+                out_rec_meta_i64[unsafe_offset=m_base + 6] = Int64(-1)
                 out_rec_meta_i64[unsafe_offset=m_base + 7] = Int64(0)
+                out_rec_meta_i64[unsafe_offset=m_base + 8] = Int64(0)
+                out_rec_meta_i64[unsafe_offset=m_base + 9] = Int64(0)
 
     parallelize(pack_worker, nw)
     return Int64(n_rec * stride_bytes)
+
+
+@export("marray_file_pool_create")
+def marray_file_pool_create(
+    paths_blob: ImmPointer[UInt8, ImmUntrackedOrigin],
+    path_offsets: ImmPointer[Int64, ImmUntrackedOrigin],
+    n_files: Int32,
+) abi("C") -> Int64:
+    var raw = alloc(Layout[CatalogFilePool](count=1))
+    var ptr = raw^.unsafe_leak()
+    ptr.unsafe_write(CatalogFilePool(paths_blob, path_offsets, Int(n_files)))
+    return Int64(Int(ptr))
+
+
+@export("marray_file_pool_destroy")
+def marray_file_pool_destroy(handle: Int64) abi("C") -> Int32:
+    if handle != 0:
+        var ptr = MutPointer[CatalogFilePool, MutUntrackedOrigin](
+            unsafe_from_address=Int(handle)
+        )
+        _ = ptr.unsafe_take_pointee()
+        ptr.unsafe_free()
+    return Int32(0)
 
 
 @export("marray_exec_general_plan")
@@ -291,7 +318,7 @@ def marray_exec_multi_sink_plan(
     var nc = Int(n_cats)
     var cat_descs = List[CatalogSourceDesc](capacity=nc)
     for c in range(nc):
-        var cb = c * 9
+        var cb = c * 11
         cat_descs.append(
             CatalogSourceDesc(
                 Int(cat_i64[unsafe_offset=cb + 0]),
@@ -305,6 +332,8 @@ def marray_exec_multi_sink_plan(
                 Int(cat_i64[unsafe_offset=cb + 8]),
                 cat_f32[unsafe_offset=c * 2 + 0],
                 cat_f32[unsafe_offset=c * 2 + 1],
+                Int(cat_i64[unsafe_offset=cb + 9]),
+                Int(cat_i64[unsafe_offset=cb + 10]),
             )
         )
 
