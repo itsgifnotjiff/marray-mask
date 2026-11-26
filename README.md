@@ -38,6 +38,9 @@ pixi run test            # 6 Mojo std.testing.TestSuite unit tests (incl. catalo
 pixi run synth-bench     # Standalone Mojo Tier-1 grtyp (U/O/Z/L/G/N/M) fill+decode demo
 pixi run bench-boreal    # Realistic Boreal/Aether B1-B8 suite (M1 catalog, M4 duck array, aether, stat)
 pixi run bench-vs-dask   # General 4-way Mojo VM vs NumPy.ma vs Xarray vs Dask benchmark
+# Real GDPS FST (set MARRAY_CMC_IO + MARRAY_FST_PRES_ROOT; no paths in-tree):
+# export MARRAY_CMC_IO=... MARRAY_FST_PRES_ROOT=...
+pixi run bench-fst-real -- --smoke
 ```
 
 ## Example Usage: M1 `RecordCatalog`, M4 `xr.Dataset` Duck Array & `aether` Handoff

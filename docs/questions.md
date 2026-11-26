@@ -2,7 +2,7 @@
 
 These questions target the highest-leverage design decisions for turning `marray-mask` from a standalone Mojo morsel VM into a drop-in orchestration and compute replacement under `boreal-io`, `boreal-postproc`, `boreal-stat`, `aether`, `polaris`, and `mogc-api`.
 
-**Answers below** are point-in-time conclusions from current boreal-io / postproc / stat / aether / mogc-api code and [`docs/boreal/`](boreal/README.md) contracts. No operational filesystem paths.
+**§1–§4 (Q1–Q15)** are answered design decisions from current boreal-io / postproc / stat / aether / mogc-api code and [`docs/boreal/`](boreal/README.md) contracts. **§5** is the forward **wishlist** after the real-FST hybrid smoke (`bench_fst_real`). No operational filesystem paths in the answered Qs.
 
 ---
 
@@ -99,3 +99,39 @@ These questions target the highest-leverage design decisions for turning `marray
     Which coordinate lookup patterns appear most in `boreal` consumers: `isel` by integer index, `sel` by `datetime64[ns]` validity time / forecast lead hours, or `sel` by decoded `vertical` pressure/hybrid level (`ip1`)?
 
     **Answer:** Serving apps (**polaris / mogc**) lean **`isel` / lead-path filters + nearest vertical**. Science plugins lean **decoded `vertical` values**. CF **`datetime64` time** exists on cubes but is secondary to lead/index selection on the hot serve path. Implement all three; optimize **`isel` + vertical nearest** first.
+
+---
+
+## 5. Wishlist — Accelerate the Boreal Stack (Post Real-FST Smoke)
+
+**Verdict:** The hybrid smoke on live GDPS `pres` (`grtyp=Z`, ~1251×1801) is **promising for the “load FSTs into xarray and compute without Dask” thesis**, with one caveat.
+
+| Smoke proved | Smoke did *not* prove |
+|--------------|----------------------|
+| Real arenas: R-B2 peel ~**55×** vs column HLG; R-B4 KE ~**19×** vs eager/column | End-to-end **lazy** open that skips boreal `open_fst` HLG + full eager unpack |
+| M1 catalog + `PlaneSlotCache` on **real geometry** (R-B6) | Live `cmc_io_fst_data` as `ChunkDecoderCABI` (R-B6 **re-packs** with the builtin codec) |
+| Phase 0 real `datyp=134` decode is measurable | Catalog open ≪1 s with O(headers) RAM ([`10-mojo-replacement-checklist.md`](boreal/10-mojo-replacement-checklist.md) acceptance) |
+
+Compute / M4 duck path ([`open_fst_xarray`](../python/marray_xr/duck.py)) is directionally right. Stack-level win still needs ARCHITECTURE M1 “next step”: headers + real unpacker + `mmap`/`pread` into `CatalogVarSpec`, then serve through a real `xr.Dataset` without Dask. Items below are a **prioritized backlog**, not re-litigation of Q1–Q15.
+
+### P0 — Make `open_fst` → xarray the fast path (“at least load”)
+
+16. **Live header → catalog:** Wire `cmc_io_fst_hdr` rows (`path`, `addr`, `lng`, `datyp`, `nbits`, `ni`/`nj`, mask offsets) into `CatalogVarSpec` / `PackedFSTArchive`-shaped meta **without re-encoding** payloads.
+17. **Real `ChunkDecoder`:** Export / adapt a `ChunkDecoderCABI`-compatible symbol from `cmc_io_fst` (`unpack_*_from_raw`) so `decoder_fn_addr` is the **production** codec—not `marray_builtin_fst_chunk_decoder` on re-packed bytes.
+18. **I/O pool:** OS `mmap`/`pread` + per-worker fd pool for multi-file leads (remove Python memmap LRU from the hot path).
+19. **Ops `open_fst_xarray(paths)`:** Return `list[xr.Dataset]` with CF dims (`time`, `vertical`, `rlat`/`rlon`), `fst_*` attrs, `areacell`, `vctype` split — parity with boreal `open_fst` assembly, **zero Dask HLG**.
+20. **BackendEntrypoint:** Register `xr.open_dataset(..., engine="marray_fst")` (ARCHITECTURE M4 next step).
+
+### P1 — Kill peel / rewrap in consumers
+
+21. **Plugin drop-in:** Let `boreal-postproc` / `boreal-stat` accept `MarrayDuckArray` or `mxr.Dataset` without `.values` peel (Humidex / WindModulus / `r.diag` already bench-shaped).
+22. **M3 mask algebra:** Bitmask `where` / boolean ops for mask-replace plugins.
+23. **aether handoff:** Make `to_aether_flat` / finite prep the default polaris→aether path (B8 already shows large prep wins).
+24. **Streaming sink:** Default postproc write via `stream_write_fst` (Q14); **mozarr** second.
+
+### P2 — Scale & polish
+
+25. **Packed `@@`:** `UInt64` 1-bit bitmap unpack in boreal-io (Q3 follow-on; ~32× less bitmap traffic than float32 0/1 planes).
+26. **Serve cache:** Multi-lead / multi-request catalog cache for mogc/polaris warmup (Q12).
+27. **M2 / M5 leftovers:** Rank-N odometer + remaining loaders; stencils only where not delegated to aether.
+28. **True stack KPI:** Extend [`bench_fst_real`](../benchmarks/bench_fst_real.py) to report **lazy open + first `.isel` compute** vs boreal `chunks='column'|'record'|False` on the same leads.
