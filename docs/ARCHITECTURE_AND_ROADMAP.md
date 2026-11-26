@@ -86,17 +86,22 @@ Using the cross-package contracts in [`docs/boreal/`](boreal/README.md) and the 
   2. `open_fst(chunks="column")` — Dask `HighLevelGraph` (`_lazy_column_chunk` batching all `n_z` levels per `time` step).
   3. `open_fst(chunks=False)` — Eager `np.where` bitmap apply + `.values` peel → NumPy kernel → `xr.DataArray` rewrap (`fst_*` attrs).
 
-#### Suite Results (`grtyp=U` Yin–Yang Supergrid `16 × 10 × 606 × 540` + 19,200-Record Open Tax)
+#### Suite Results (`grtyp=U` Yin–Yang Supergrid `16 × 10 × 606 × 540` + Suites B1–B8)
 
-| Realistic Boreal Suite (All Verified `assert_allclose`) | `chunks='record'` HLG | `chunks='column'` HLG (16T) | `chunks=False` Eager Peel/Rewrap | `marray_xr` (Mojo 1.2 VM) | Speedup |
+Following the engineering decisions clarified in [`docs/questions.md`](questions.md) (Q1–Q15), `marray-mask` now implements **M1 (`RecordCatalog` + C-ABI `ChunkDecoder` + `PlaneSlotCache`)**, **M4 (`MarrayDuckArray` inside genuine `xr.Dataset`)**, **single-pass multi-sink fusion (`compute_many`)**, **exact `Float64` morsel parity (`precision='float64'`, `rmse_f64`)**, **`TILE_COLS = 64` `(column, level)` vertical scans**, **batched finite `aether` CSR handoff (`to_aether_flat`)**, and **chunked streaming `stream_write_fst`**:
+
+| Realistic Boreal / Aether Suite (`bench_boreal_realistic.py`) | `chunks='record'` HLG | `chunks='column'` HLG (16T) | Eager Peel / Transpose | `marray_xr` (Mojo 1.2) | Speedup |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **Bench 1:** `open_fst` Graph Assembly (80 leads × 40 lvls × 6 vars = 19,200 records, no I/O) | `32.76 ms` (16,080 tasks) | `1.62 ms` (400 tasks) | — | **`0.012 ms`** | **`2,760×` vs `record`** (`137×` vs `column`) |
-| **Bench 2:** `polaris` Thin 2D Peel (`isel(t=3,z=2)` + `WindModulus` → `(nj, ni)` C-buf for `aether`) | `7.024 ms` | `31.841 ms` *(reads all 10 lvls)* | — | **`0.858 ms`** | **`8.2×` vs `record`** (**`37.1×` vs `column`**) |
-| **Bench 3:** `boreal-postproc` Spooki `Humidex` (`exp`) + Direct `fst_mask_fill=1e30` Write Cube | — | `525.57 ms` | `635.69 ms` | **`60.43 ms`** | **`8.7×` vs `column` HLG** (**`10.5×` vs Eager**) |
-| **Bench 4:** `boreal-stat` `r.diag` (`ke` + Yin–Yang `areacell` Weighted `globavg` + `zonavg`) | — | `537.69 ms` | `549.57 ms` | **`84.88 ms`** | **`6.3×` vs `column` HLG** (`6.5×` vs Eager) |
+| **B1:** `open_fst` Assembly (80 leads × 40 lvls × 6 vars = 19,200 recs) | `36.22 ms` | `1.79 ms` | — | **`0.017 ms`** (`0.533 ms` M4 `xr.Dataset`) | **`2,144×` vs `record`** (`106×` vs `column`) |
+| **B2:** `polaris` Thin 2D Peel (`isel` + nearest `vertical` → `(nj, ni)` buf) | `7.816 ms` | `32.119 ms` | — | **`0.772 ms`** (`2.384 ms` M4 `xr.Dataset`) | **`10.1×` vs `record`** (**`41.6×` vs `column`**) |
+| **B3:** `boreal-postproc` `Humidex` (`float32` `@@`) + `stream_write_fst` (`1e30`) | — | `428.58 ms` | `689.65 ms` | **`76.48 ms`** (`89.00 ms` streaming sink) | **`5.6×` vs `column`** (**`9.0×` vs Eager**) |
+| **B4:** `boreal-stat` `r.diag` (`ke` `globavg` + `zonavg`, single-pass `compute_many`) | — | `457.80 ms` | `1,195.35 ms` (`values_f64`) | **`61.63 ms`** (`119.58 ms` exact `float64`) | **`7.4×` vs `column`** (**`10.0×` exact `f64`**, `rel_err=2.0e-14`) |
+| **B6:** M1 C-ABI `ChunkDecoder` (`datyp=134` + `datyp=2` `@@`, cross-`vctype` + regional) | — | `523.49 ms` (`78.97 ms` reg) | — | **`193.08 ms`** (**`23.79 ms`** regional) | **`2.7×–3.3×` faster** + **`~21 MB` RAM cap** |
+| **B7:** `boreal-postproc` Vertical Column Scan (`TILE_COLS=64` vs 4D transpose) | — | — | `1,088.62 ms` (`419 MB` copy) | **`116.14 ms`** | **`9.4×` faster** (zero 4D transpose) |
+| **B8:** `aether` Batched `(4, 327240)` Finite Prep + `mogc-api` 8-Thread 16-Lead Warmup | — | `20.206 ms` / `132.10 ms` | — | **`0.547 ms`** / **`6.68 ms`** | **`36.9×` `aether` prep** / **`19.8×` 8T warmup** |
 
 > [!TIP]
-> **Resolving the `column` vs. `record` Dilemma (`04-lazy-layouts.md`):** Today in `boreal-io`, `chunks="column"` keeps HLG construction manageable (`1.62 ms`) at the cost of `37×` slower 2D peels in `polaris` (`31.84 ms`, over-reading the whole vertical column), whereas `chunks="record"` speeds up 2D peels (`7.02 ms`) at the cost of `20×` larger HLG dictionaries (`32.76 ms` at 19k records, seconds/GBs at suite scale). `marray-mask`'s parametric catalog gives **both** a `12 µs` open **and** a `0.858 ms` single-record 2D peel from the exact same `Dataset`.
+> **Resolving the `column` vs. `record` Dilemma (`04-lazy-layouts.md`):** Today in `boreal-io`, `chunks="column"` keeps HLG construction manageable (`1.79 ms`) at the cost of `41×` slower 2D peels in `polaris` (`32.12 ms`, over-reading the whole vertical column), whereas `chunks="record"` speeds up 2D peels (`7.82 ms`) at the cost of `20×` larger HLG dictionaries (`36.22 ms` at 19k records, seconds/GBs at suite scale). `marray-mask`'s parametric catalog gives **both** a `17 µs` open **and** a `0.772 ms` single-record 2D peel from the exact same `Dataset`.
 
 #### Bench 5 — Tier-1 Operational `grtyp` Catalog Sweep (~99% of Operational Header Rows)
 Workload: 5-variable moist wind-thermal diagnostic (`hypot(UU, VV) * 0.514444 * HU + (TM_sfc - TT_4d)`) across `SynthGridSpec.large`:
@@ -156,10 +161,12 @@ flowchart TD
 
 | File | Role |
 | :--- | :--- |
-| [`src/marray/morsel.mojo`](../src/marray/morsel.mojo) | 64-byte aligned `MorselReg`, single-pass span decoders (`load_span_u16`, `load_span_f32`), 4-way unrolled SIMD math, domain-safe `div`/`sqrt`/`log`, and 64-element bitmask word-skipping `ReduceAcc` kernels. |
-| [`src/marray/vm.mojo`](../src/marray/vm.mojo) | 24-opcode general bytecode ISA (`BC_LOAD`..`BC_FILLNA`), `SourceBinding` N-D stride descriptor, 3-pass compiler (`compile_and_optimize_dag`), and multi-threaded N-D morsel executor (`execute_bytecode_plan`). |
-| [`src/marray_mojo.mojo`](../src/marray_mojo.mojo) | Shared-library entrypoint exporting both `PyInit_marray_mojo` (`PythonModuleBuilder`) and `marray_exec_general_plan` (`abi("C")`). |
-| [`python/marray_xr/__init__.py`](../python/marray_xr/__init__.py) | General Python drop-in `Dataset`, `DataArray`, and `Variable` with CSE AST staging, `__array_ufunc__`, ascending/descending `.sel()`/`.isel()`, `.where()`, `.fillna()`, and scalar/axis reductions. |
+| [`src/marray/morsel.mojo`](../src/marray/morsel.mojo) | 64-byte aligned `MorselReg` (`Float32`) & `MorselReg64` (`Float64`), single-pass span decoders (incl. native `MSRC_FST_BITMAP_F32` `float32` `0/1` `@@` planes), 4-way unrolled SIMD math, and 64-element bitmask word-skipping `ReduceAcc` kernels. |
+| [`src/marray/catalog.mojo`](../src/marray/catalog.mojo) | M1 separate-`.so` C-ABI `ChunkDecoder` (`ChunkDecoderCABI`), `is_datyp_parallel_safe` (`datyp=6` guard), whole-record `PlaneSlotCache` (1 decode/plane on regional slices), and reference `datyp=134` / `datyp=2` codecs. |
+| [`src/marray/vertical.mojo`](../src/marray/vertical.mojo) | L1d-resident `TILE_COLS = 64` `(column, level)` vertical physics scheduler matching `cmc_postproc_kernels` (`lift_columns` / `vertical_scan_columns`) with zero 4D cube transpose. |
+| [`src/marray/vm.mojo`](../src/marray/vm.mojo) | 24-opcode general bytecode ISA, 3-pass multi-sink compiler (`compile_and_optimize_multi_dag`), `execute_multi_sink_plan`, spatial-partitioned high-rank axis reductions, and `execute_bytecode_plan_f64`. |
+| [`src/marray_mojo.mojo`](../src/marray_mojo.mojo) | Shared-library entrypoint exporting `PyInit_marray_mojo` (`PythonModuleBuilder`) plus zero-GIL C-ABI entrypoints (`marray_exec_multi_sink_plan`, `marray_exec_general_plan_f64`, `marray_exec_vertical_column_scan`, `marray_builtin_fst_chunk_decoder`). |
+| [`python/marray_xr/`](../python/marray_xr/__init__.py) | `Dataset`/`DataArray`/`Variable`, [`catalog.py`](../python/marray_xr/catalog.py) (`open_fst_catalog`, cross-`vctype` `from_sources`), [`duck.py`](../python/marray_xr/duck.py) (M4 `MarrayDuckArray`, `open_fst_xarray`), `compute_many`, `to_aether_flat`, `rmse_f64`, and `stream_write_fst`. |
 | [`src/marray/slab.mojo`](../src/marray/slab.mojo) | Standalone pure-Mojo 2D Fortran-contiguous `MaskedSlab` container, 1-bit bitmap (`@@`) decoder, and synthetic ECCC GDPS layer generator. |
 | [`src/marray/lazy.mojo`](../src/marray/lazy.mojo) | Standalone pure-Mojo `GDPSGridSpec`, `DomainWindow`, `LazyGraph`, and slab-level bounded `WorkerArena` executor. |
 | [`src/marray/xarray.mojo`](../src/marray/xarray.mojo) | Standalone pure-Mojo `Dataset`, `DataArray`, `CoordAxis` ($O(\log N)$ ascending/descending binary search), and `Variant` metadata `attrs`. |
@@ -215,6 +222,10 @@ When extending this codebase, keep these exact Mojo 1.2 behaviors in mind (also 
 5. **Dual `PyInit_` + `abi("C")` Shared Library Pattern:**
    * Conda's `c-compiler` package ships an older `GLIBC 2.17` sysroot that fails linking standalone Mojo executables (`undefined reference to dladdr@GLIBC_2.34`), whereas `mojo build -O3 --emit shared-lib` links cleanly on any Linux/macOS environment.
    * Exporting **both** `PyInit_marray_mojo` (`PythonModuleBuilder`) and `marray_exec_general_plan` (`abi("C")`) in [`src/marray_mojo.mojo`](../src/marray_mojo.mojo) allows native `import marray_mojo` in matching Python environments while letting `ctypes` call the zero-GIL C-ABI across *any* Python version (including Python 3.13/3.14+ free-threading builds) with zero CPython ABI coupling.
+6. **ASAP Destruction When Laundering Addresses via `Int(list.unsafe_ptr())`:**
+   Because Mojo uses **ASAP (As-Soon-As-Possible) value destruction** rather than lexical-scope end destruction, converting a Mojo `List` or `Allocation` pointer to a raw integer (`Int(buf.unsafe_ptr())`) for a C-ABI / `ImmUntrackedOrigin` descriptor hides provenance from the borrow checker. If `buf` is not referenced later in the function, Mojo frees `buf` *immediately* after `Int(buf.unsafe_ptr())`—before the C-ABI / morsel reader executes! Always pin Mojo-owned buffers past the final untracked consumer call with `_ = buf` (or keep them referenced in Python across `ctypes` calls via a `keep_alive` list).
+7. **Zero-Overhead Separate-`.so` C-ABI `ChunkDecoder` Function Pointers:**
+   To link `boreal-io`'s `cmc_io_fst` `.so` with `marray_mojo.so` without Python GIL callbacks (`docs/questions.md` Q1), declare `comptime ChunkDecoderCABI = def(...) thin abi("C") -> Int32`, verify `comptime assert size_of[ChunkDecoderCABI]() == size_of[Int]()`, and cast the symbol address (`var slot = fn_addr; var fn_ptr = Pointer(to=slot).unsafe_bitcast[ChunkDecoderCABI]()[]`). LLVM compiles this to a direct register `call` instruction with zero wrapper overhead.
 
 ---
 
@@ -265,31 +276,26 @@ For compute-dense diagnostics (3D moist thermodynamics, iterative wet-bulb/equiv
 
 Boreal-facing milestone checklist and phased UX (duck array → pure Mojo Dataset): [`docs/boreal/10-mojo-replacement-checklist.md`](boreal/10-mojo-replacement-checklist.md).
 
-### Milestone M1 — Pluggable Out-of-Core Binary File Catalog & Decoder Trait
-* **Deliverables:**
-  * `trait ChunkDecoder`: `def decode_record(self, raw_bytes: Span[UInt8, _], i0: Int, i1: Int, j0: Int, j1: Int, mut dst: MaskedSlab)`
-  * `MmapRecordCatalog`: binary manifest mapping `(var, run, step, level)` to `(file_id, offset, size)` with POSIX `pread` + per-worker `fd` cache.
-  * Streaming chunked output writer (`sink_to_binary` / `sink_to_zarr_v3`) so $1\text{ TB} \to 1\text{ PB}$ transformations run in $< 256\text{ MB}$ constant RAM.
-* **Acceptance Criteria:** Process a multi-file $> 20\text{ GB}$ on-disk binary dataset on a machine with a hard $512\text{ MB}$ memory cap at NVMe bandwidth speed.
+### Milestone M1 — Pluggable Out-of-Core Binary File Catalog & Decoder Trait *(Core Engine Implemented)*
+* **Implemented in v0.3 (`src/marray/catalog.mojo`, `python/marray_xr/catalog.py`):**
+  * Separate-`.so` `ChunkDecoderCABI` function-pointer interface + `is_datyp_parallel_safe` (`datyp=6` serial safety guard).
+  * Per-worker `PlaneSlotCache` whole-record plane decoder (`datyp=134` + `datyp=2` `float32` `0/1` `@@` bitmaps), regional `[j0:j1, i0:i1]` single-decode slicing, cross-`vctype` `list[Dataset]` joins (`from_sources`), and chunked `stream_write_fst` (`fst_mask_fill=1e30`).
+* **Next Step (On Work Machine with `boreal-io`):** Wire `cmc_io_fst_hdr` header arrays + `cmc_io_fst` raw unpacker symbol address + OS `pread`/`mmap` file-descriptor pool directly into `CatalogVarSpec`, and optionally add a packed-`UInt64` 1-bit `@@` unpack entry in `boreal-io` (`32×` less bitmap traffic than `float32` `0/1` planes).
 
-### Milestone M2 — Rank-Generic Coordinate Odometer & Output-Tiled Axis Reductions
-* **Deliverables:**
-  * Replace 4D `divmod` unpacking in `vm.mojo` with a rank-$N$ ($1 \le N \le 8$) coordinate odometer.
-  * Add **Output-Tile Parallel Scheduling** when `out_cells > 262_144`, eliminating the `n_workers * out_cells` partial accumulator multiplier.
-  * Add native `int8`, `uint8`, `int16`, `int32`, `int64`, and `float64` span loaders + selectable `Float64` compute precision mode.
-* **Acceptance Criteria:** Reduce `(2400, 1201, 80, 24) -> (2400, 1201, 80)` (`mean(dim="time")`) in $< 1\text{×}$ output buffer memory with zero worker merge copy.
+### Milestone M2 — Rank-Generic Coordinate Odometer & Output-Tiled Axis Reductions *(Partially Implemented)*
+* **Implemented in v0.3 (`src/marray/vm.mojo`):**
+  * Spatial-partitioned axis reductions when inner `(d0, d1)` are kept and `out_cells > 65,536` (`0` cross-worker buffer replication), single-pass multi-sink fusion (`execute_multi_sink_plan` / `compute_many`), and full `Float64` morsel parity path (`execute_bytecode_plan_f64` / `rmse_f64`).
+* **Remaining:** Replace 4D `divmod` unpacking with a rank-$N$ ($1 \le N \le 8$) coordinate odometer and add native `int8`/`int16`/`int32`/`int64` span loaders.
 
 ### Milestone M3 — Full Boolean Mask Algebra & Ternary `where(cond, x, y)`
 * **Deliverables:**
   * Add `BC_CMP_{EQ,NE,LT,LE,GT,GE}` producing bitmask registers, `BC_MASK_{AND,OR,XOR,NOT}`, and 3-operand `BC_WHERE(cond, true_val, false_val)`.
   * Support `DataArray` boolean operators (`&`, `|`, `~`) and cross-variable `xr.where(cond, x, y)`.
-* **Acceptance Criteria:** Arbitrary multi-variable compound expressions (`xr.where((TT < 0) & (PR > 1.0), snow_ratio * PR, 0.0)`) match Xarray bit-for-bit.
 
-### Milestone M4 — Xarray `BackendEntrypoint` & `__array_namespace__` Duck Array
-* **Deliverables:**
-  * Implement Python Array API (`__array_namespace__`) + `xarray.namedarray.core._new` compatibility on `marray_xr.LazyDuckArray`.
-  * Register `pyproject.toml` `[project.entry-points."xarray.backends"]` so `xr.open_dataset(..., engine="marray")` returns a real `xarray.Dataset` backed by Mojo `LazyDuckArray` instead of `dask.array`.
-* **Acceptance Criteria:** Standard Xarray `ds.sel(time="2026-11-25")`, `ds.assign(...)`, and `ds["TT"].hvplot()` work unmodified with zero Dask imports.
+### Milestone M4 — Xarray `BackendEntrypoint` & `__array_namespace__` Duck Array *(Phase A Implemented)*
+* **Implemented in v0.3 (`python/marray_xr/duck.py`):**
+  * `MarrayDuckArray` (`__array_ufunc__`, `__array_function__`, `__getitem__`, `__array__`) + `open_fst_xarray` returning genuine `list[xr.Dataset]` objects without Dask.
+* **Next Step:** Register `[project.entry-points."xarray.backends"]` (`xr.open_dataset(..., engine="marray_fst")`) and complete full Python Array API (`__array_namespace__`) coverage (`concat`, `broadcast_arrays`, `where`).
 
 ### Milestone M5 — Spatial Stencils, Halo Exchange & Coordinate Alignment
 * **Deliverables:**

@@ -27,13 +27,23 @@ from marray import (
     hypot,
     slab_mask_fraction,
     slab_reduce_stats,
+    CatalogSourceDesc,
+    PlaneSlotCache,
+    VCOL_CAPE_PARCEL_PROXY,
+    is_datyp_parallel_safe,
+    load_morsel_from_catalog,
+    pack_bmap_plane_datyp2_1bit,
+    pack_f32_plane_datyp134,
+    execute_vertical_column_scan,
 )
 from marray.morsel import (
+    MSRC_FST_BITMAP_F32,
     MSRC_SENTINEL_INT,
     MSTATE_BITS,
     MSTATE_VALID,
     MorselReg,
     ReduceAcc,
+    load_span_f32,
     load_span_u16,
     morsel_accumulate_stats,
     morsel_hypot,
@@ -48,7 +58,8 @@ from marray.vm import (
     SourceBinding,
     compile_and_optimize_dag,
 )
-from std.memory import ImmPointer
+from std.memory import ImmPointer, MutPointer
+from std.testing import assert_false
 
 
 def test_fortran_layout_and_subslab_slicing() raises:
@@ -256,6 +267,108 @@ def test_dataset_sel_descending_levels() raises:
     var rep = wspd.compute_stats()
     assert_equal(rep.active_slabs, 98)
     assert_true(rep.stats.valid_count < rep.stats.total_count)
+
+
+def test_catalog_datyp134_float32_bitmap_and_vertical_tiles() raises:
+    # Q2: Verify datyp thread-safety classifier (`datyp=6` must NOT be parallel-safe!)
+    assert_true(is_datyp_parallel_safe(134))
+    assert_true(is_datyp_parallel_safe(2))
+    assert_false(is_datyp_parallel_safe(6))
+
+    # Q3 + Q4: Pack a 17x9 = 153-cell plane (`datyp=134`) + 1-bit `@@` (`datyp=2, nbits=1`),
+    # unpack whole-record into `float32` `0/1` bitmap plane, and slice a regional sub-rect!
+    var ni = 17
+    var nj = 9
+    var nelm = ni * nj
+    var src_plane = List[Float32](capacity=nelm)
+    var bmap_u8 = List[UInt8](capacity=nelm)
+    for j in range(nj):
+        for i in range(ni):
+            src_plane.append(Float32(10.0 + Float32(i) + Float32(j) * 0.5))
+            bmap_u8.append(UInt8(0) if (i == 5 and j == 3) else UInt8(1))
+
+    var raw_archive = List[UInt8](capacity=1024)
+    raw_archive.resize(1024, UInt8(0))
+    var d_bytes = pack_f32_plane_datyp134(
+        ImmPointer[Float32, origin_of(src_plane)](src_plane.unsafe_ptr()),
+        nelm,
+        raw_archive.unsafe_ptr(),
+    )
+    var bm_bytes = pack_bmap_plane_datyp2_1bit(
+        ImmPointer[UInt8, origin_of(bmap_u8)](bmap_u8.unsafe_ptr()),
+        nelm,
+        raw_archive.unsafe_ptr().unsafe_offset(d_bytes),
+    )
+
+    var meta: List[Int64] = [
+        Int64(0),
+        Int64(d_bytes),
+        Int64(134),
+        Int64(16),
+        Int64(d_bytes),
+        Int64(bm_bytes),
+        Int64(2),
+        Int64(1),
+    ]
+    var desc = CatalogSourceDesc(
+        Int(raw_archive.unsafe_ptr()),
+        Int(meta.unsafe_ptr()),
+        1,
+        ni,
+        nj,
+        1,
+        1,
+        0,
+        0,
+        1.0,
+        0.0,
+    )
+    var slot = PlaneSlotCache(nelm)
+    var reg = MorselReg()
+    # Regional slice `i in [3..8), j in [2..5)` (5x3 = 15 cells, contains masked `(5,3)`!)
+    load_morsel_from_catalog(desc, slot, 3, 5, 2, 3, 0, 1, 0, 0, 15, reg)
+    _ = raw_archive
+    _ = meta
+    var acc = ReduceAcc()
+    morsel_accumulate_stats[False](reg, 15, acc)
+    assert_equal(acc.valid_count, 14)
+
+    # Q6: Test L1-resident `TILE_COLS=64` vertical column scan across 70 columns (> 1 tile!)
+    var n_t = 2
+    var nk = 5
+    var v_nj = 7
+    var v_ni = 10  # 70 columns -> exercises 64 + 6 tail column tile!
+    var v_tot = n_t * nk * v_nj * v_ni
+    var tt_4d = List[Float32](capacity=v_tot)
+    var hu_4d = List[Float32](capacity=v_tot)
+    var bm_4d = List[UInt8](capacity=v_tot)
+    for k in range(v_tot):
+        tt_4d.append(Float32(22.0 - Float32((k // 70) % nk) * 6.5))
+        hu_4d.append(Float32(12.0))
+        bm_4d.append(UInt8(1))
+    var lvls: List[Float32] = [1000.0, 850.0, 700.0, 500.0, 300.0]
+    var out_cape = List[Float32](capacity=n_t * 70)
+    out_cape.resize(n_t * 70, Float32(0.0))
+
+    execute_vertical_column_scan(
+        ImmPointer[Float32, origin_of(tt_4d)](tt_4d.unsafe_ptr()),
+        ImmPointer[Float32, origin_of(hu_4d)](hu_4d.unsafe_ptr()),
+        True,
+        ImmPointer[UInt8, origin_of(bm_4d)](bm_4d.unsafe_ptr()),
+        1,
+        ImmPointer[Float32, origin_of(lvls)](lvls.unsafe_ptr()),
+        n_t,
+        nk,
+        v_nj,
+        v_ni,
+        VCOL_CAPE_PARCEL_PROXY,
+        0,
+        0,
+        Float32(-999.0),
+        out_cape.unsafe_ptr(),
+    )
+    assert_true(out_cape[0] > Float32(0.0))
+    assert_almost_equal(Float64(out_cape[0]), Float64(out_cape[69]), atol=1e-4)
 
 
 def main() raises:

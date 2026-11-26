@@ -1,24 +1,27 @@
 # `marray-mask` — General Mojo 1.2 Masked Lazy Array & Xarray/Dask Engine
 
-A high-performance **Mojo 1.2** masked array and lazy bytecode execution stack designed to replace Python's `NumPy.ma + Dask + Xarray` chunk-orchestration bottleneck on large ($10\text{ GB} \to 1\text{ PB+}$), Fortran-contiguous scientific datasets (modeled on ECCC's **GDPS** NWP archive).
+A high-performance **Mojo 1.2** masked array, whole-record `ChunkDecoder` catalog, and lazy bytecode execution stack designed to replace Python's `NumPy.ma + Dask + Xarray` chunk-orchestration bottleneck on large ($10\text{ GB} \to 1\text{ PB+}$) scientific/NWP datasets across the **boreal** (`boreal-io`, `boreal-postproc`, `boreal-stat`, `polaris`, `mogc-api`) and **aether** ecosystem.
 
 📖 **Deep-Dive Documentation:**
-* **[`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md)** — Full architectural design, roofline math, bytecode compiler internals, realistic Boreal/Aether benchmarks, Mojo 1.2 subtleties, limitations audit, and M1–M6 roadmap.
-* **[`docs/boreal/`](docs/boreal/README.md)** — Cross-package contracts for `boreal-io` (`open_fst`, `@@` bitmaps, `column`/`record` HLG), `boreal-postproc`, `boreal-stat`, `aether`, `polaris`, and `mogc-api`.
+* **[`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md)** — Full architectural design, C-ABI `ChunkDecoder` & M4 duck-array contracts, roofline math, B1–B8 Boreal/Aether benchmarks, Mojo 1.2 subtleties, and remaining roadmap.
+* **[`docs/boreal/`](docs/boreal/README.md)** & **[`docs/questions.md`](docs/questions.md)** — Cross-package contracts and answered engineering decisions for `boreal-io`, `boreal-postproc`, `boreal-stat`, `aether`, `polaris`, and `mogc-api`.
 
 ---
 
-## Highlights & Realistic Boreal Stack Benchmarks
+## Highlights & Realistic Boreal / Aether Benchmarks (Suites B1–B8)
 
-Tested against realistic `boreal-io` `HighLevelGraph` (`chunks="record"` and `chunks="column"`), `chunks=False` Eager Peel→NumPy→Rewrap, and Eager Xarray across all 7 Tier-1 RPN `grtyp` geometries (`U` Yin–Yang 53%, `O` Coastal 23%, `Z` Rotated 15%, `G` Gaussian 3%, `N` Polar Stereo 3%, `L` Lat-Lon 2%, `M` Mesh <1%) using C-contiguous `(time, vertical, y, x)` cubes and `fstd2nc`-polarity `@@` bitmaps (`keep > 0, mask == 0`, verified `assert_allclose` on Ryzen 7 5800X 16T):
+Verified with `assert_allclose` (including `< 1e-12` relative IEEE-754 `float64` parity on `boreal-stat` `r.diag` / `RMSE`) on Ryzen 7 5800X (8C/16T) across C-contiguous `(time, vertical, y, x)` cubes, `fstd2nc`-polarity `float32` `0/1` `@@` bitmaps (`keep > 0, mask == 0`), whole-record `datyp=134` compressed planes, and all 7 Tier-1 RPN `grtyp` families (`U, O, Z, G, N, L, M`):
 
-| Realistic Boreal Suite (`benchmarks/bench_boreal_realistic.py`) | `record` HLG | `column` HLG (16T) | Eager Peel/Rewrap | `marray_xr` (Mojo 1.2 VM) | Speedup |
+| Realistic Boreal / Aether Suite ([`bench_boreal_realistic.py`](benchmarks/bench_boreal_realistic.py)) | `record` HLG | `column` HLG (16T) | Eager Peel / Transpose | `marray_xr` (Mojo 1.2) | Speedup |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **B1:** `open_fst` Graph Assembly (80 leads × 40 lvls × 6 vars = 19,200 records) | `32.76 ms` | `1.62 ms` | — | **`0.012 ms`** | **`2,760×` vs `record`** (`137×` vs `column`) |
-| **B2:** `polaris` Thin 2D Peel (`grtyp=U` `606×540`, `WindModulus` → `aether` `(nj,ni)` buf) | `7.024 ms` | `31.841 ms` | — | **`0.858 ms`** | **`8.2×` vs `record`** (**`37.1×` vs `column`**) |
-| **B3:** `boreal-postproc` Spooki `Humidex` (`exp`) + Direct `1e30` (`fst_mask_fill`) Write Buf | — | `525.57 ms` | `635.69 ms` | **`60.43 ms`** | **`8.7×` vs `column`** (**`10.5×` vs Eager**) |
-| **B4:** `boreal-stat` `r.diag` (`ke` + Yin–Yang `areacell` Weighted `globavg` + `zonavg`) | — | `537.69 ms` | `549.57 ms` | **`84.88 ms`** | **`6.3×` vs `column`** (`6.5×` vs Eager) |
-| **B5:** Tier-1 `grtyp` Sweep (`U, O, Z, G, N, L, M` at `SynthGridSpec.large`) | `170–298 ms` | `147–313 ms` | `195–393 ms` | **`10.7–23.6 ms`** | **`11.9×–16.8×` vs `column` HLG** |
+| **B1:** `open_fst` Assembly (80 leads × 40 lvls × 6 vars = 19,200 recs) | `36.22 ms` | `1.79 ms` | — | **`0.017 ms`** (`0.53 ms` M4 `xr.Dataset`) | **`2,144×` vs `record`** (`106×` vs `column`) |
+| **B2:** `polaris` Thin 2D Peel (`isel` + nearest `vertical` → `(nj,ni)` buf) | `7.82 ms` | `32.12 ms` | — | **`0.772 ms`** (`2.38 ms` M4 `xr.Dataset`) | **`10.1×` vs `record`** (**`41.6×` vs `column`**) |
+| **B3:** `boreal-postproc` `Humidex` (`float32` `@@`) + `stream_write_fst` (`1e30`) | — | `428.58 ms` | `689.65 ms` | **`76.48 ms`** (`89.0 ms` streaming sink) | **`5.6×` vs `column`** (**`9.0×` vs Eager**) |
+| **B4:** `boreal-stat` `r.diag` (`ke` `globavg` + `zonavg`, single-pass `compute_many`) | — | `457.80 ms` | `1,195.35 ms` (`values_f64`) | **`61.63 ms`** (`119.6 ms` exact `float64`) | **`7.4×` vs `column`** (**`10.0×` exact `f64`**) |
+| **B5:** Tier-1 `grtyp` Sweep (`U, O, Z, G, N, L, M`, 99% catalog share) | `142–258 ms` | `131–281 ms` | `171–344 ms` | **`9.62–18.98 ms`** | **`12.8×–15.8×` vs `column` HLG** |
+| **B6:** M1 C-ABI `ChunkDecoder` (`datyp=134` + `datyp=2` `@@`, cross-`vctype` + regional) | — | `523.49 ms` (`79.0 ms` reg) | — | **`193.08 ms`** (**`23.79 ms`** regional) | **`2.7×–3.3×` faster + `~21 MB` RAM cap** |
+| **B7:** `boreal-postproc` Vertical Column Scan (`TILE_COLS=64` vs 4D transpose) | — | — | `1,088.62 ms` (`419 MB` copy) | **`116.14 ms`** | **`9.4×` faster** (zero 4D transpose) |
+| **B8:** `aether` Batched `(4, 327240)` Finite Prep + `mogc-api` 8-Thread Warmup | — | `20.21 ms` / `132.1 ms` | — | **`0.547 ms`** / **`6.68 ms`** | **`36.9×` `aether` prep** / **`19.8×` 8T warmup** |
 
 *(On raw quantized `uint16` full-cube benchmarks in [`bench_mojo_vs_dask_xarray.py`](benchmarks/bench_mojo_vs_dask_xarray.py), single-pass decode + L1 morsel fusion reaches **`49.89 ms` (`28.9 GB/s` physical DRAM read)** vs `5,025 ms` in Dask [`100.7×`] and `7,863 ms` in `numpy.ma` [`157.6×`].)*
 
@@ -31,43 +34,43 @@ git clone git@github.com:itsgifnotjiff/marray-mask.git
 cd marray-mask
 
 pixi install
-pixi run test            # Mojo std.testing.TestSuite unit tests (incl. Tier-1 synth grids)
+pixi run test            # 6 Mojo std.testing.TestSuite unit tests (incl. catalog & vertical tiles)
 pixi run synth-bench     # Standalone Mojo Tier-1 grtyp (U/O/Z/L/G/N/M) fill+decode demo
-pixi run bench-boreal    # Realistic Boreal/Aether suite (record/column HLG, peel-rewrap, U..M)
+pixi run bench-boreal    # Realistic Boreal/Aether B1-B8 suite (M1 catalog, M4 duck array, aether, stat)
 pixi run bench-vs-dask   # General 4-way Mojo VM vs NumPy.ma vs Xarray vs Dask benchmark
 ```
 
-## Example Usage (`python/marray_xr`)
+## Example Usage: M1 `RecordCatalog`, M4 `xr.Dataset` Duck Array & `aether` Handoff
 
 ```python
 import numpy as np
 import marray_xr as mxr
 
-ds = mxr.Dataset(
-    {
-        "TT": mxr.Variable(("lon", "lat", "level", "time"), tt_u16, scale=0.01, offset=-120.0, fill_value=0xFFFF),
-        "UU": mxr.Variable(("lon", "lat", "level", "time"), uu_u16, scale=0.01, offset=-120.0, fill_value=0xFFFF),
-        "VV": mxr.Variable(("lon", "lat", "level", "time"), vv_u16, scale=0.01, offset=-120.0, fill_value=0xFFFF),
-        "HU": mxr.Variable(("lon", "lat", "level", "time"), hu_u16, scale=0.001, qc_flags=hu_qf, qc_max_valid=1),
-        "TM": mxr.Variable(("lon", "lat", "time"), tm_f32, mask=land_mask),  # 3D auto-broadcasts into 4D!
-    },
-    coords={"lon": lons, "lat": lats, "level": levels, "time": times},
+# 1. Open packed FST archive into `list[mxr.Dataset]` split by `vctype` (hybrid + surface)
+ds_list = mxr.open_fst_catalog(archive)  # zero payload unpack at open time!
+tt = mxr.from_sources(ds_list, "TT")
+tm = mxr.from_sources(ds_list, "TM")     # 3D surface auto-broadcasts against 4D hybrid!
+
+# 2. M4 Drop-in `xarray.Dataset` (`MarrayDuckArray`) for unmodified downstream plugins:
+xr_datasets = mxr.open_fst_xarray(archive)
+uv_2d = np.hypot(xr_datasets[0]["WindU"].isel(time=3), xr_datasets[0]["WindV"].isel(time=3))
+
+# 3. Single-pass multi-sink fusion (`globavg` + `zonavg` in ONE scan) & `aether` finite flat buffer:
+ke = 0.5 * ((ds_list[0].find_by_nomvar("UU") * 0.514444) ** 2 + (ds_list[0].find_by_nomvar("VV") * 0.514444) ** 2)
+glob_ke, zon_ke = mxr.compute_many(
+    ke.lazy_weighted_mean(ds_list[0].cell_measures["areacell"]),
+    ke.lazy_mean(("time", "x")),
 )
-
-sub = ds.sel(lon=slice(280.0, 312.0), lat=slice(42.0, 58.0), level=slice(1000.0, 500.0), time=slice(6.0, 60.0))
-wspd = np.hypot(sub["UU"], sub["VV"]) * 0.514444
-ratio = (wspd * sub["HU"]) / (sub["TT"] + 273.15)
-jet = ratio.where(ratio >= 0.35)
-
-map_2d = jet.mean(dim=("level", "time"))  # Returns labeled xarray.DataArray
+flat_for_aether = mxr.to_aether_flat([tt.isel(time=0, vertical=0), tm.isel(time=0)], masked_fill=0.0)
 ```
 
 ## Repository Structure
 
-* [`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md) — Comprehensive technical spec, optimizations, Mojo 1.2 subtleties, limitations, and M1–M6 roadmap
-* [`src/marray/morsel.mojo`](src/marray/morsel.mojo) — 64-byte aligned 2,048-element L1 `MorselReg`, single-pass decoders & 4-way unrolled SIMD kernels
-* [`src/marray/vm.mojo`](src/marray/vm.mojo) — General 24-opcode bytecode VM, 3-pass optimizer (CSE + CF-scale/FMA/HYPOT fusion + register coloring) & N-D executor
-* [`src/marray_mojo.mojo`](src/marray_mojo.mojo) — Native `PyInit_marray_mojo` (`PythonModuleBuilder`) + zero-GIL C-ABI shared library entrypoint
-* [`python/marray_xr/`](python/marray_xr/__init__.py) — General Python Xarray/Dask replacement frontend
-* [`src/marray/slab.mojo`](src/marray/slab.mojo), [`lazy.mojo`](src/marray/lazy.mojo), [`xarray.mojo`](src/marray/xarray.mojo), [`numpy_bridge.mojo`](src/marray/numpy_bridge.mojo) — Standalone pure-Mojo stack & NumPy zero-copy bridge
+* [`docs/ARCHITECTURE_AND_ROADMAP.md`](docs/ARCHITECTURE_AND_ROADMAP.md) — Architecture spec, C-ABI contracts, optimizations, Mojo 1.2 lessons, and roadmap
+* [`src/marray/morsel.mojo`](src/marray/morsel.mojo) — 64-byte aligned `MorselReg` (`Float32`) & `MorselReg64` (`Float64`), `float32` `@@` bitmaps, 4-way unrolled SIMD kernels
+* [`src/marray/catalog.mojo`](src/marray/catalog.mojo) — M1 C-ABI `ChunkDecoder`, `is_datyp_parallel_safe` (`datyp=6` guard), `PlaneSlotCache`, and reference `datyp=134`/`datyp=2` codecs
+* [`src/marray/vertical.mojo`](src/marray/vertical.mojo) — L1-resident `TILE_COLS = 64` `(column, level)` vertical physics scheduler (`cmc_postproc_kernels` contract)
+* [`src/marray/vm.mojo`](src/marray/vm.mojo) — 24-opcode bytecode VM, 3-pass multi-sink optimizer, spatial-partitioned axis reductions, and `Float64` parity engine
+* [`src/marray_mojo.mojo`](src/marray_mojo.mojo) — `PyInit_marray_mojo` (`PythonModuleBuilder`) + zero-GIL C-ABI shared library exports
+* [`python/marray_xr/`](python/marray_xr/__init__.py) — `Dataset`/`DataArray`, M1 [`catalog.py`](python/marray_xr/catalog.py), M4 [`duck.py`](python/marray_xr/duck.py) (`MarrayDuckArray`), `compute_many`, `to_aether_flat`, `stream_write_fst`
 * [`.agents/skills/`](.agents/skills/) — Vendored official Modular Mojo & MAX skills (`modular/skills`)

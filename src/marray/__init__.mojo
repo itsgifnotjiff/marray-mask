@@ -78,3 +78,22 @@ from .synth import (
     materialize_var_cube,
     slab_mask_fraction,
 )
+from .catalog import (
+    ChunkDecoderCABI,
+    CatalogSourceDesc,
+    PlaneSlotCache,
+    REC_META_STRIDE,
+    is_datyp_parallel_safe,
+    builtin_fst_chunk_decode,
+    pack_f32_plane_datyp134,
+    pack_bmap_plane_datyp2_1bit,
+    load_morsel_from_catalog,
+)
+from .vertical import (
+    TILE_COLS,
+    VCOL_HYPSOMETRIC_INTEGRAL,
+    VCOL_CAPE_PARCEL_PROXY,
+    VCOL_COLUMN_MAX,
+    VerticalColumnKernelCABI,
+    execute_vertical_column_scan,
+)
