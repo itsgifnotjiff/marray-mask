@@ -1,0 +1,11 @@
+.pixi/
+__mojocache__/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+*.so
+*.dylib
+*.dll
+*.o
+.DS_Store

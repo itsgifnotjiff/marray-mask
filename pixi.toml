@@ -1,0 +1,21 @@
+[workspace]
+name = "marray-mask"
+version = "0.2.0"
+description = "General Mojo 1.2 masked lazy array engine & drop-in Xarray/Dask replacement"
+channels = ["https://conda.modular.com/max", "conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+mojo = ">=1.0,<2.0"
+max-core = ">=26.5"
+python = ">=3.12"
+numpy = ">=2.0"
+xarray = ">=2025.1"
+dask = "*"
+
+[tasks]
+test = "mojo run -O3 -I src tests/test_marray_mask.mojo"
+interop = "mojo run -O3 -I src src/interop_demo.mojo"
+demo = "mojo run -O3 -I src src/gdps_prototype.mojo"
+build-ext = "bash -c 'mkdir -p build && mojo build -O3 --emit shared-lib -I src src/marray_mojo.mojo -o build/marray_mojo.so'"
+bench-vs-dask = { cmd = "python -u benchmarks/bench_mojo_vs_dask_xarray.py", depends-on = ["build-ext"] }
