@@ -19,7 +19,8 @@ test-p0 = { cmd = "python -u tests/test_p0_multifile_xarray_load.py", depends-on
 interop = "mojo run -O3 -I src src/interop_demo.mojo"
 demo = "mojo run -O3 -I src src/gdps_prototype.mojo"
 synth-bench = "mojo run -O3 -I src src/synth_bench_demo.mojo"
-build-ext = "bash -c 'mkdir -p build && mojo build -O3 --emit shared-lib -I src src/marray_mojo.mojo -o build/marray_mojo.so'"
+build-ext = "bash -c 'mkdir -p build && mojo build -O3 --emit shared-lib -I src src/marray_mojo.mojo -o build/marray_mojo.so && python bridges/build_cmc_bridge.py'"
+build-cmc-bridge = "python bridges/build_cmc_bridge.py"
 bench-vs-dask = { cmd = "python -u benchmarks/bench_mojo_vs_dask_xarray.py", depends-on = ["build-ext"] }
 bench-boreal = { cmd = "python -u benchmarks/bench_boreal_realistic.py", depends-on = ["build-ext"] }
 bench-fst-real = { cmd = "python -u benchmarks/bench_fst_real.py", depends-on = ["build-ext"] }

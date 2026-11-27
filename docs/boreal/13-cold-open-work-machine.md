@@ -282,4 +282,20 @@ pixi run bench-fst-real -- --leads 4 --mode lazy-open
 5. [`10-mojo-replacement-checklist.md`](10-mojo-replacement-checklist.md)
 6. Code: [`fst_open.py`](../../python/marray_xr/fst_open.py),
    [`bridges/cmc_io_cabi_shim.mojo`](../../bridges/cmc_io_cabi_shim.mojo),
+   [`bridges/build_cmc_bridge.py`](../../bridges/build_cmc_bridge.py),
    [`benchmarks/bench_fst_real.py`](../../benchmarks/bench_fst_real.py)
+
+---
+
+## 10. Cold-Open Fix Wave Implemented (Ready for HPC Re-Verify)
+
+Addressing RC1–RC5 from §§4–6 (verified locally in `pixi run test-p0` with compiled mock `cmc_io_fst.xdf.unpack_batch` + `XDF0` leads; live GDPS wall-clock numbers pending re-run on the work machine):
+
+1. **RC5 fixed (`~960 ms` constant penalty removed):** Replaced `cmc_dir.glob("**/cmc_io_fst_data*.so")` in [`fst_open.py`](../../python/marray_xr/fst_open.py) (`_resolve_native_cmc_cabi_symbol`) with `@lru_cache` O(1) stat checks on `$MARRAY_CMC_DECODER_SO`, `$MARRAY_CMC_CABI_SO` (env alias), `build/libcmc_marray_bridge.so`, and direct `<cmc_dir>/src/cmc_io_fst_data.so`.
+2. **RC1 & RC2 fixed (Zero Dask HLG + parallel pre-filtered `read_records_fast`):**
+   - Wraps `boreal.io.xarray.open.read_records_fast` to scan multi-lead files concurrently (`ThreadPoolExecutor`) and immediately filter raw header rows to requested `nomvar`s + RPN coordinate/vgrid/mask companions (`>>`, `^^`, `^>`, `!!`, `HY`, `P0`, `PT`, `@@`, `!@`) before Python DataFrame IP1/date/mask passes.
+   - Intercepts `boreal.io.xarray.stack._stack_variable` (and `open._stack_variable`) to build `(n_rec, 10)` `rec_meta` + `CatalogVarSpec` + `MarrayDuckArray` directly from group record rows—skipping `dask.base.tokenize`, `HighLevelGraph` creation, HLG scraping, `Path.exists()` `stat()` calls, and double `xr.Dataset` rebuilds, while permuting `rec_meta` to match finalized `Dataset` `time`/`vertical` coordinate order.
+3. **RC3 & RC4 fixed (`bridges/cmc_io_cabi_shim.mojo` + auto-build in `pixi run build-ext`):**
+   - Rewrote [`bridges/cmc_io_cabi_shim.mojo`](../../bridges/cmc_io_cabi_shim.mojo) against `cmc_io_fst.xdf.unpack_batch` (`MutPtr`, `unpack_one_f32` with `local_addr=1` and `rpn_lng = raw_byte_len >> 3` over `FilePool` `pread` buffers).
+   - Added [`bridges/build_cmc_bridge.py`](../../bridges/build_cmc_bridge.py) into `pixi run build-ext` so `build/libcmc_marray_bridge.so` compiles automatically on the work machine whenever `MARRAY_CMC_IO` is set (activating Tier A `FilePool` `pread` on `XDF0` leads, while keeping Tier B keyword-only `unpack_record_from_path(..., layout="C")` for `RSF0` / fallback).
+4. **Telemetry in `bench_fst_real.py`:** `R-P0` now prints `Tier=A|B`, `direct_catalog_vars`, `hlg_fallback_vars`, and `prefiltered_rows` before the timing table.

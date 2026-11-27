@@ -509,12 +509,14 @@ struct PlaneSlotCache(Movable):
                 unsafe_from_address=desc.file_pool_addr
             )
             var fd = pool_p[].fds[file_id]
-            _ = _pread_exact(
+            var got = _pread_exact(
                 fd,
                 self._raw_scratch.unsafe_ptr().unsafe_offset(prefix_z),
                 rec_len,
                 rec_off,
             )
+            for tail_i in range(prefix_z + got, need_sz):
+                self._raw_scratch[tail_i] = UInt8(0)
             var raw_p = ImmPointer[UInt8, ImmUntrackedOrigin](
                 unsafe_from_address=Int(self._raw_scratch.unsafe_ptr())
             )

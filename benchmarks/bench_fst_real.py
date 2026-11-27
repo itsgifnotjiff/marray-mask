@@ -284,8 +284,15 @@ def run_rp0_lazy_open_and_first_peel(
         is_dask=False,
     )
     decs = mxr.get_last_decoded_planes()
+    open_info = mxr.get_last_fst_open_info()
     np.testing.assert_allclose(got_uv, ref_uv, rtol=1e-4, atol=1e-3, equal_nan=True)
 
+    print(
+        f"  marray path: Tier={open_info.get('tier')} | "
+        f"direct_catalog_vars={open_info.get('direct_catalog_vars')} | "
+        f"hlg_fallback_vars={open_info.get('hlg_fallback_vars')} | "
+        f"prefiltered_rows={open_info.get('prefiltered_rows')}"
+    )
     print(f"  {'Mode':<34} {'Open (ms)':>11} {'1st Peel (ms)':>14} {'Cold Total':>12} {'vs Eager':>10}")
     print("  " + "-" * 85)
     for label, om, pm in [

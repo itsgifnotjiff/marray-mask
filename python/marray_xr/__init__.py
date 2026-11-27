@@ -1821,6 +1821,7 @@ from .duck import (  # noqa: E402
     wrap_dataset_as_xarray,
 )
 from .fst_open import (  # noqa: E402
+    get_last_fst_open_info,
     open_fst_paths_catalog,
     open_fst_paths_xarray,
 )
@@ -1854,6 +1855,7 @@ __all__ = [
     "from_sources",
     "get_builtin_decoder_addr",
     "get_last_decoded_planes",
+    "get_last_fst_open_info",
     "get_mojo_lib",
     "has_gpu_accelerator",
     "open_fst_catalog",

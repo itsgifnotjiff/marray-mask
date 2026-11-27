@@ -116,7 +116,7 @@ Compute / M4 duck path ([`open_fst_xarray`](../python/marray_xr/duck.py)) is dir
 
 ### P0 — Make `open_fst` → xarray the fast path (“at least load”)
 
-Status vs work-machine smoke ([`boreal/13-cold-open-work-machine.md`](boreal/13-cold-open-work-machine.md)): **16 / 17 / 19 partial**; **18** done for `.mfst` / Tier A only (Tier B skips pool); **20** done; **28** done (KPI exposes open regression). Live ops cold open is still **slower** than boreal `chunks='record'`.
+Status vs work-machine smoke ([`boreal/13-cold-open-work-machine.md`](boreal/13-cold-open-work-machine.md)): first HPC smoke exposed `~960 ms` recursive `.so` glob + HLG scrape + stale shim (`RC1`–`RC5`). Fix wave in §10 of [`boreal/13-cold-open-work-machine.md`](boreal/13-cold-open-work-machine.md) removes `glob("**")`, parallelizes & pre-filters `read_records_fast`, bypasses `_stack_variable` Dask HLG construction, and rewrites/auto-builds `cmc_io_cabi_shim.mojo` against `cmc_io_fst.xdf.unpack_batch.unpack_one_f32` — **ready for HPC re-verification**.
 
 16. **Live header → catalog:** Wire `cmc_io_fst_hdr` rows (`path`, `addr`, `lng`, `datyp`, `nbits`, `ni`/`nj`, mask offsets) into `CatalogVarSpec` / `PackedFSTArchive`-shaped meta **without re-encoding** payloads. *(Partial: ops path scrapes boreal record HLG instead of a direct header table.)*
 17. **Real `ChunkDecoder`:** Export / adapt a `ChunkDecoderCABI`-compatible symbol from `cmc_io_fst` (`unpack_*_from_raw` / `unpack_one_f32`) so `decoder_fn_addr` is the **production** codec—not `marray_builtin_fst_chunk_decoder` on re-packed bytes. *(Blocked: shim stale vs `cmc_io_fst.xdf.unpack_batch`; Tier B ctypes trampoline only.)*
